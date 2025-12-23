@@ -1,0 +1,216 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Optional
+
+import duckdb
+
+
+@dataclass
+class DuckDBDataset:
+    version: str
+    data_dir: Path
+    con: duckdb.DuckDBPyConnection
+
+    def close(self) -> None:
+        self.con.close()
+
+    def list_item_matches(self, query: str, limit: int) -> list[dict]:
+        sql = """
+            select distinct item_id, meta
+            from (
+                select item_id, meta from read_parquet(?)
+                union all
+                select item_id, meta from read_parquet(?)
+            )
+            where item_id ilike ?
+            limit ?
+        """
+        rows = self.con.execute(
+            sql,
+            [
+                str(self.data_dir / "item_inputs.parquet"),
+                str(self.data_dir / "item_outputs.parquet"),
+                f"%{query}%",
+                int(limit),
+            ],
+        ).fetchall()
+        return [
+            {"item_id": row[0], "meta": int(row[1])}
+            for row in rows
+        ]
+
+    def list_fluid_matches(self, query: str, limit: int) -> list[dict]:
+        sql = """
+            select distinct fluid_id
+            from (
+                select fluid_id from read_parquet(?)
+                union all
+                select fluid_id from read_parquet(?)
+            )
+            where fluid_id ilike ?
+            limit ?
+        """
+        rows = self.con.execute(
+            sql,
+            [
+                str(self.data_dir / "fluid_inputs.parquet"),
+                str(self.data_dir / "fluid_outputs.parquet"),
+                f"%{query}%",
+                int(limit),
+            ],
+        ).fetchall()
+        return [{"fluid_id": row[0]} for row in rows]
+
+    def recipe_by_rid(self, rid: str) -> Optional[dict]:
+        sql = """
+            select rid, machine_id, recipe_class, duration_ticks, eut
+            from read_parquet(?)
+            where rid = ?
+        """
+        row = self.con.execute(sql, [str(self.data_dir / "recipes.parquet"), rid]).fetchone()
+        if not row:
+            return None
+        return {
+            "rid": row[0],
+            "machine_id": row[1],
+            "recipe_class": row[2],
+            "duration_ticks": int(row[3]),
+            "eut": int(row[4]),
+        }
+
+    def recipe_inputs(self, rid: str) -> dict:
+        items = self.con.execute(
+            """
+            select item_id, meta, count
+            from read_parquet(?)
+            where rid = ?
+            """,
+            [str(self.data_dir / "item_inputs.parquet"), rid],
+        ).fetchall()
+        fluids = self.con.execute(
+            """
+            select fluid_id, mb
+            from read_parquet(?)
+            where rid = ?
+            """,
+            [str(self.data_dir / "fluid_inputs.parquet"), rid],
+        ).fetchall()
+        return {
+            "items": [{"item_id": r[0], "meta": int(r[1]), "count": int(r[2])} for r in items],
+            "fluids": [{"fluid_id": r[0], "mb": int(r[1])} for r in fluids],
+        }
+
+    def recipe_outputs(self, rid: str) -> dict:
+        items = self.con.execute(
+            """
+            select item_id, meta, count
+            from read_parquet(?)
+            where rid = ?
+            """,
+            [str(self.data_dir / "item_outputs.parquet"), rid],
+        ).fetchall()
+        fluids = self.con.execute(
+            """
+            select fluid_id, mb
+            from read_parquet(?)
+            where rid = ?
+            """,
+            [str(self.data_dir / "fluid_outputs.parquet"), rid],
+        ).fetchall()
+        return {
+            "items": [{"item_id": r[0], "meta": int(r[1]), "count": int(r[2])} for r in items],
+            "fluids": [{"fluid_id": r[0], "mb": int(r[1])} for r in fluids],
+        }
+
+    def recipes_for_output_item(self, item_id: str, meta: int, limit: int) -> list[dict]:
+        sql = """
+            select r.rid, r.machine_id, r.duration_ticks, r.eut
+            from read_parquet(?) r
+            join read_parquet(?) o
+            on r.rid = o.rid
+            where o.item_id = ? and o.meta = ?
+            limit ?
+        """
+        rows = self.con.execute(
+            sql,
+            [
+                str(self.data_dir / "recipes.parquet"),
+                str(self.data_dir / "item_outputs.parquet"),
+                item_id,
+                int(meta),
+                int(limit),
+            ],
+        ).fetchall()
+        return [
+            {
+                "rid": r[0],
+                "machine_id": r[1],
+                "duration_ticks": int(r[2]),
+                "eut": int(r[3]),
+            }
+            for r in rows
+        ]
+
+    def recipes_for_output_fluid(self, fluid_id: str, limit: int) -> list[dict]:
+        sql = """
+            select r.rid, r.machine_id, r.duration_ticks, r.eut
+            from read_parquet(?) r
+            join read_parquet(?) o
+            on r.rid = o.rid
+            where o.fluid_id = ?
+            limit ?
+        """
+        rows = self.con.execute(
+            sql,
+            [
+                str(self.data_dir / "recipes.parquet"),
+                str(self.data_dir / "fluid_outputs.parquet"),
+                fluid_id,
+                int(limit),
+            ],
+        ).fetchall()
+        return [
+            {
+                "rid": r[0],
+                "machine_id": r[1],
+                "duration_ticks": int(r[2]),
+                "eut": int(r[3]),
+            }
+            for r in rows
+        ]
+
+
+class DataSource:
+    def list_versions(self) -> Iterable[str]:
+        raise NotImplementedError
+
+    def open_dataset(self, version: str) -> DuckDBDataset:
+        raise NotImplementedError
+
+
+class LocalDataSource(DataSource):
+    def __init__(self, data_dir: Path, default_version: str) -> None:
+        self.data_dir = data_dir
+        self.default_version = default_version
+
+    def list_versions(self) -> Iterable[str]:
+        return [self.default_version]
+
+    def open_dataset(self, version: str) -> DuckDBDataset:
+        if version != self.default_version:
+            raise ValueError(f"Unknown version: {version}")
+        con = duckdb.connect(database=":memory:")
+        return DuckDBDataset(version=version, data_dir=self.data_dir, con=con)
+
+
+class S3DataSource(DataSource):
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def list_versions(self) -> Iterable[str]:
+        raise NotImplementedError("S3 data source not implemented")
+
+    def open_dataset(self, version: str) -> DuckDBDataset:
+        raise NotImplementedError("S3 data source not implemented")
