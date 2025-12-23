@@ -4,6 +4,7 @@ __pycache__/
 .env
 .env.*
 backend/.venv/
+in/
 frontend/node_modules/
 frontend/dist/
 .DS_Store
