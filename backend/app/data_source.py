@@ -153,6 +153,38 @@ class DuckDBDataset:
             for r in rows
         ]
 
+    def recipes_for_output_item_by_machine(
+        self, item_id: str, meta: int, machine_id: str, limit: int
+    ) -> list[dict]:
+        sql = """
+            select r.rid, r.machine_id, r.duration_ticks, r.eut
+            from read_parquet(?) r
+            join read_parquet(?) o
+            on r.rid = o.rid
+            where o.item_id = ? and o.meta = ? and r.machine_id = ?
+            limit ?
+        """
+        rows = self.con.execute(
+            sql,
+            [
+                str(self.data_dir / "recipes.parquet"),
+                str(self.data_dir / "item_outputs.parquet"),
+                item_id,
+                int(meta),
+                machine_id,
+                int(limit),
+            ],
+        ).fetchall()
+        return [
+            {
+                "rid": r[0],
+                "machine_id": r[1],
+                "duration_ticks": int(r[2]),
+                "eut": int(r[3]),
+            }
+            for r in rows
+        ]
+
     def recipes_for_output_fluid(self, fluid_id: str, limit: int) -> list[dict]:
         sql = """
             select r.rid, r.machine_id, r.duration_ticks, r.eut
@@ -170,6 +202,110 @@ class DuckDBDataset:
                 fluid_id,
                 int(limit),
             ],
+        ).fetchall()
+        return [
+            {
+                "rid": r[0],
+                "machine_id": r[1],
+                "duration_ticks": int(r[2]),
+                "eut": int(r[3]),
+            }
+            for r in rows
+        ]
+
+    def recipes_for_output_fluid_by_machine(
+        self, fluid_id: str, machine_id: str, limit: int
+    ) -> list[dict]:
+        sql = """
+            select r.rid, r.machine_id, r.duration_ticks, r.eut
+            from read_parquet(?) r
+            join read_parquet(?) o
+            on r.rid = o.rid
+            where o.fluid_id = ? and r.machine_id = ?
+            limit ?
+        """
+        rows = self.con.execute(
+            sql,
+            [
+                str(self.data_dir / "recipes.parquet"),
+                str(self.data_dir / "fluid_outputs.parquet"),
+                fluid_id,
+                machine_id,
+                int(limit),
+            ],
+        ).fetchall()
+        return [
+            {
+                "rid": r[0],
+                "machine_id": r[1],
+                "duration_ticks": int(r[2]),
+                "eut": int(r[3]),
+            }
+            for r in rows
+        ]
+
+    def machines_for_output_item(self, item_id: str, meta: int, limit: int = 200) -> list[str]:
+        sql = """
+            select distinct r.machine_id
+            from read_parquet(?) r
+            join read_parquet(?) o
+            on r.rid = o.rid
+            where o.item_id = ? and o.meta = ?
+            order by r.machine_id
+            limit ?
+        """
+        rows = self.con.execute(
+            sql,
+            [
+                str(self.data_dir / "recipes.parquet"),
+                str(self.data_dir / "item_outputs.parquet"),
+                item_id,
+                int(meta),
+                int(limit),
+            ],
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def machines_for_output_fluid(self, fluid_id: str, limit: int = 200) -> list[str]:
+        sql = """
+            select distinct r.machine_id
+            from read_parquet(?) r
+            join read_parquet(?) o
+            on r.rid = o.rid
+            where o.fluid_id = ?
+            order by r.machine_id
+            limit ?
+        """
+        rows = self.con.execute(
+            sql,
+            [
+                str(self.data_dir / "recipes.parquet"),
+                str(self.data_dir / "fluid_outputs.parquet"),
+                fluid_id,
+                int(limit),
+            ],
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def list_machines(self) -> list[str]:
+        sql = """
+            select distinct machine_id
+            from read_parquet(?)
+            order by machine_id
+        """
+        rows = self.con.execute(sql, [str(self.data_dir / "recipes.parquet")]).fetchall()
+        return [row[0] for row in rows]
+
+    def recipes_for_machine(self, machine_id: str, limit: int) -> list[dict]:
+        sql = """
+            select rid, machine_id, duration_ticks, eut
+            from read_parquet(?)
+            where machine_id = ?
+            limit ?
+        """
+        rows = self.con.execute(
+            sql,
+            [str(self.data_dir / "recipes.parquet"), machine_id, int(limit)],
         ).fetchall()
         return [
             {

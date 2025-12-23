@@ -34,5 +34,23 @@ npm run dev
   Start-Process powershell -ArgumentList "-NoExit", "-Command", $frontendCmd
 }
 
+function Wait-Backend {
+  param(
+    [int]$Retries = 60,
+    [int]$DelaySeconds = 1
+  )
+  for ($i = 0; $i -lt $Retries; $i++) {
+    try {
+      Invoke-WebRequest -Uri "http://localhost:8000/api/versions" -UseBasicParsing | Out-Null
+      return $true
+    } catch {
+      Start-Sleep -Seconds $DelaySeconds
+    }
+  }
+  return $false
+}
+
 Start-Backend
+Wait-Backend | Out-Null
+Start-Sleep -Seconds 2
 Start-Frontend

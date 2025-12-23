@@ -112,14 +112,21 @@ def recipes_by_output(
     item_id: str | None = None,
     meta: int = 0,
     fluid_id: str | None = None,
+    machine_id: str | None = None,
     limit: int = 10,
     version: str | None = None,
 ):
     dataset = data_source.open_dataset(version or settings.default_version)
     if output_type == "item" and item_id:
-        recipes = dataset.recipes_for_output_item(item_id, meta, limit)
+        if machine_id:
+            recipes = dataset.recipes_for_output_item_by_machine(item_id, meta, machine_id, limit)
+        else:
+            recipes = dataset.recipes_for_output_item(item_id, meta, limit)
     elif output_type == "fluid" and fluid_id:
-        recipes = dataset.recipes_for_output_fluid(fluid_id, limit)
+        if machine_id:
+            recipes = dataset.recipes_for_output_fluid_by_machine(fluid_id, machine_id, limit)
+        else:
+            recipes = dataset.recipes_for_output_fluid(fluid_id, limit)
     else:
         dataset.close()
         raise HTTPException(status_code=400, detail="Invalid output selector")
@@ -167,6 +174,121 @@ def recipes_by_output(
         )
     dataset.close()
     return {"recipes": enriched}
+
+
+@app.get("/api/machines/by-output")
+def machines_by_output(
+    output_type: str,
+    item_id: str | None = None,
+    meta: int = 0,
+    fluid_id: str | None = None,
+    limit: int = 200,
+    version: str | None = None,
+):
+    dataset = data_source.open_dataset(version or settings.default_version)
+    if output_type == "item" and item_id:
+        machine_ids = dataset.machines_for_output_item(item_id, meta, limit)
+    elif output_type == "fluid" and fluid_id:
+        machine_ids = dataset.machines_for_output_fluid(fluid_id, limit)
+    else:
+        dataset.close()
+        raise HTTPException(status_code=400, detail="Invalid output selector")
+    dataset.close()
+    machines = [
+        {
+            "machine_id": machine_id,
+            "machine_name": name_index.machine_names.get(machine_id, machine_id),
+        }
+        for machine_id in machine_ids
+    ]
+    return {"machines": machines}
+
+
+@app.get("/api/machines")
+def list_machines(version: str | None = None):
+    dataset = data_source.open_dataset(version or settings.default_version)
+    machine_ids = dataset.list_machines()
+    dataset.close()
+    machines = []
+    for machine_id in machine_ids:
+        machines.append(
+            {
+                "machine_id": machine_id,
+                "machine_name": name_index.machine_names.get(machine_id, machine_id),
+            }
+        )
+    return {"machines": machines}
+
+
+@app.get("/api/recipes/by-machine")
+def recipes_by_machine(
+    machine_id: str,
+    limit: int = 50,
+    q: str | None = None,
+    version: str | None = None,
+):
+    dataset = data_source.open_dataset(version or settings.default_version)
+    q_lower = q.lower() if q else None
+    results = []
+    raw_recipes = dataset.recipes_for_machine(machine_id, limit if not q else limit * 5)
+    for recipe in raw_recipes:
+        info = name_index.recipes.get(recipe["rid"], {})
+        inputs = dataset.recipe_inputs(recipe["rid"])
+        outputs = dataset.recipe_outputs(recipe["rid"])
+        item_outputs = [
+            {
+                **item,
+                "name": name_index.items.get((item["item_id"], item["meta"])),
+            }
+            for item in outputs["items"]
+        ]
+        fluid_outputs = [
+            {
+                **fluid,
+                "name": name_index.fluids.get(fluid["fluid_id"]),
+            }
+            for fluid in outputs["fluids"]
+        ]
+        if q_lower:
+            def _match_output(output: dict, key: str) -> bool:
+                name = (output.get("name") or output.get(key) or "").lower()
+                return q_lower in name
+
+            if not (
+                any(_match_output(item, "item_id") for item in item_outputs)
+                or any(_match_output(fluid, "fluid_id") for fluid in fluid_outputs)
+            ):
+                continue
+
+        results.append(
+            {
+                **recipe,
+                "machine_name": info.get("machine_name") or recipe.get("machine_id"),
+                "min_tier": info.get("min_tier"),
+                "min_voltage": info.get("min_voltage"),
+                "amps": info.get("amps"),
+                "item_inputs": [
+                    {
+                        **item,
+                        "name": name_index.items.get((item["item_id"], item["meta"])),
+                    }
+                    for item in inputs["items"]
+                ],
+                "fluid_inputs": [
+                    {
+                        **fluid,
+                        "name": name_index.fluids.get(fluid["fluid_id"]),
+                    }
+                    for fluid in inputs["fluids"]
+                ],
+                "item_outputs": item_outputs,
+                "fluid_outputs": fluid_outputs,
+            }
+        )
+        if len(results) >= limit:
+            break
+    dataset.close()
+    return {"recipes": results}
 
 
 @app.post("/api/graph")

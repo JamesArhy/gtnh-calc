@@ -35,6 +35,24 @@ export async function fetchRecipesByOutput(params: {
   item_id?: string
   meta?: number
   fluid_id?: string
+  machine_id?: string
+  limit?: number
+}) {
+  const query = new URLSearchParams({ output_type: params.output_type })
+  if (params.item_id) query.set("item_id", params.item_id)
+  if (params.meta !== undefined) query.set("meta", String(params.meta))
+  if (params.fluid_id) query.set("fluid_id", params.fluid_id)
+  if (params.machine_id) query.set("machine_id", params.machine_id)
+  if (params.limit) query.set("limit", String(params.limit))
+  const res = await fetch(`/api/recipes/by-output?${query.toString()}`)
+  return res.json()
+}
+
+export async function fetchMachinesByOutput(params: {
+  output_type: "item" | "fluid"
+  item_id?: string
+  meta?: number
+  fluid_id?: string
   limit?: number
 }) {
   const query = new URLSearchParams({ output_type: params.output_type })
@@ -42,6 +60,6 @@ export async function fetchRecipesByOutput(params: {
   if (params.meta !== undefined) query.set("meta", String(params.meta))
   if (params.fluid_id) query.set("fluid_id", params.fluid_id)
   if (params.limit) query.set("limit", String(params.limit))
-  const res = await fetch(`/api/recipes/by-output?${query.toString()}`)
+  const res = await fetch(`/api/machines/by-output?${query.toString()}`)
   return res.json()
 }
