@@ -439,6 +439,48 @@ label {
   font-weight: 600;
 }
 
+.saved-list {
+  display: grid;
+  gap: 10px;
+}
+
+.saved-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  background: #1f1a16;
+  border: 1px solid #3b3027;
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+
+.saved-card small {
+  display: block;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.saved-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.ghost {
+  background: transparent;
+  border: 1px solid #4a3b2e;
+  color: var(--text);
+  padding: 6px 10px;
+  border-radius: 10px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ghost.danger {
+  color: #ffb4a2;
+  border-color: #5a3a2f;
+}
+
 .graph-panel,
 .config-panel {
   background: var(--card);
@@ -466,6 +508,25 @@ label {
   border-bottom: 2px solid transparent;
   border-radius: 12px 12px 0 0;
   font-weight: 600;
+}
+
+.graph-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel-tabs .ghost {
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid #4a3b2e;
+  color: var(--text);
+  font-size: 0.75rem;
+}
+
+.panel-tabs .ghost:hover {
+  filter: brightness(1.08);
 }
 
 .panel-tabs button.active {
@@ -496,7 +557,8 @@ label {
 
 .output-panel,
 .inputs-panel,
-.options-panel {
+.options-panel,
+.saved-panel {
   display: grid;
   gap: 12px;
 }

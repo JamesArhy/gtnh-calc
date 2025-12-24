@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import cytoscape from "cytoscape"
+import cytoscapeSvg from "cytoscape-svg"
+import { jsPDF } from "jspdf"
+import { svg2pdf } from "svg2pdf.js"
 import type { GraphResponse, RecipeIOFluid, RecipeIOItem } from "./types"
 import { fetchGraph, fetchMachinesByOutput, fetchRecipesByOutput, searchFluids, searchItems } from "./api"
+
+cytoscape.use(cytoscapeSvg)
 
 const SEARCH_DEBOUNCE_MS = 300
 const OUTPUT_SEARCH_LIMIT = 30
@@ -85,6 +90,27 @@ type RecipeOption = {
   fluid_outputs?: RecipeIOFluid[]
 }
 
+type SavedConfig = {
+  outputTarget: Target | null
+  selectedRecipe: RecipeOption | null
+  inputTargets: InputTarget[]
+  rateValue: number
+  rateUnit: "min" | "sec"
+  userVoltageTier: string
+  maxCoilType: string
+  recipeTierOverrides: Record<string, string>
+  recipeOverclockTiers: Record<string, number>
+  inputRecipeOverrides: Record<string, string>
+  machineTierSelections: Record<string, string>
+}
+
+type SavedConfigEntry = {
+  id: string
+  name: string
+  savedAt: string
+  config: SavedConfig
+}
+
 export default function App() {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const cyRef = useRef<cytoscape.Core | null>(null)
@@ -105,7 +131,7 @@ export default function App() {
   const [graph, setGraph] = useState<GraphResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [graphTab, setGraphTab] = useState<"graph" | "machines">("graph")
-  const [configTab, setConfigTab] = useState<"outputs" | "inputs" | "options">("outputs")
+  const [configTab, setConfigTab] = useState<"outputs" | "inputs" | "options" | "saved">("outputs")
 
   const [showOutputModal, setShowOutputModal] = useState(true)
   const [outputQuery, setOutputQuery] = useState("")
@@ -124,9 +150,12 @@ export default function App() {
     lines: string[]
   } | null>(null)
   const graphRunTimerRef = useRef<number | null>(null)
+  const isRestoringConfigRef = useRef(false)
   const [selectionMode, setSelectionMode] = useState<"output" | "input">("output")
   const [pendingInputRate, setPendingInputRate] = useState<number | null>(null)
   const [machineTierSelections, setMachineTierSelections] = useState<Record<string, string>>({})
+  const [savedConfigs, setSavedConfigs] = useState<SavedConfigEntry[]>([])
+  const [configName, setConfigName] = useState("")
 
   const getTargetKey = (target: Target) =>
     target.type === "item" ? `item:${target.id}:${target.meta}` : `fluid:${target.id}`
@@ -217,7 +246,7 @@ export default function App() {
             "target-arrow-color": "#C9A26B",
             "target-arrow-shape": "triangle",
             "curve-style": "straight",
-            "line-width": "data(edge_width)",
+            "width": "data(edge_width)",
             "line-opacity": 0.55,
             "arrow-scale": 0.8,
             "label": "data(label)",
@@ -257,10 +286,8 @@ export default function App() {
           selector: "edge[active = \"true\"]",
           style: {
             "opacity": 1,
-            "line-opacity": 0.75,
-            "shadow-blur": 8,
-            "shadow-color": "#E9D4B4",
-            "shadow-opacity": 0.6
+            "line-opacity": 0.8,
+            "width": "data(edge_width)"
           }
         },
         {
@@ -275,9 +302,8 @@ export default function App() {
           style: {
             "line-color": "#E05555",
             "target-arrow-color": "#E05555",
-            "shadow-blur": 10,
-            "shadow-color": "#E05555",
-            "shadow-opacity": 0.8
+            "line-opacity": 0.9,
+            "width": "data(edge_width)"
           }
         },
         {
@@ -345,7 +371,6 @@ export default function App() {
         spacingFactor: 1.2,
         nodeDimensionsIncludeLabels: true
       },
-      wheelSensitivity: 0.15,
       minZoom: 0.2,
       maxZoom: 2
     })
@@ -391,6 +416,12 @@ export default function App() {
     const unit = rateUnit === "min" ? "L/min" : "L/s"
     return `${liters.toFixed(liters >= 10 ? 1 : 2)} ${unit}`
   }
+
+  const getFooterSegments = () => ({
+    left: outputTarget ? `${formatTargetName(outputTarget)} Line` : "No output selected",
+    middle: `${formatRateValue(rateUnit === "min" ? rateValue : rateValue * 60)}/min`,
+    right: totalEnergyPerTick !== null ? `${formatEnergy(totalEnergyPerTick)} EU/t` : "EU/t"
+  })
 
   const tierIndex = (tier?: string) => (tier ? TIERS.indexOf(tier) : -1)
   const getTierColor = (tier?: string) => (tier && TIER_COLORS[tier] ? TIER_COLORS[tier] : "#1C2F3F")
@@ -501,6 +532,7 @@ export default function App() {
 
   useEffect(() => {
     if (!outputTarget || !selectedRecipe) return
+    if (isRestoringConfigRef.current) return
     if (isScalingInputsRef.current) {
       isScalingInputsRef.current = false
       scheduleGraphRun(0)
@@ -511,6 +543,7 @@ export default function App() {
 
   useEffect(() => {
     if (!outputTarget || !selectedRecipe) return
+    if (isRestoringConfigRef.current) return
     const nextRatePerS = getRatePerS(rateValue, rateUnit)
     const prevRatePerS = lastTargetRatePerSRef.current
     if (prevRatePerS > 0 && nextRatePerS !== prevRatePerS && inputTargets.length > 0) {
@@ -530,6 +563,7 @@ export default function App() {
 
   useEffect(() => {
     if (!outputTarget || !selectedRecipe) return
+    if (isRestoringConfigRef.current) return
     scheduleGraphRun()
   }, [recipeOverclockTiers])
 
@@ -816,6 +850,29 @@ export default function App() {
     }
   }, [graph])
 
+  useEffect(() => {
+    const key = "gtnh_saved_configs_v1"
+    try {
+      const raw = window.localStorage.getItem(key)
+      if (!raw) return
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) {
+        setSavedConfigs(parsed)
+      }
+    } catch (err) {
+      console.warn("Failed to load saved configs", err)
+    }
+  }, [])
+
+  useEffect(() => {
+    const key = "gtnh_saved_configs_v1"
+    try {
+      window.localStorage.setItem(key, JSON.stringify(savedConfigs))
+    } catch (err) {
+      console.warn("Failed to save configs", err)
+    }
+  }, [savedConfigs])
+
   const recipeStats = useMemo(() => {
     if (!graph) return []
     return graph.nodes
@@ -839,6 +896,257 @@ export default function App() {
       return sum + node.eut * node.machines_required
     }, 0)
   }, [graph])
+
+  const restoreConfig = (entry: SavedConfigEntry) => {
+    const cfg = entry.config
+    isRestoringConfigRef.current = true
+    setOutputTarget(cfg.outputTarget)
+    setSelectedRecipe(cfg.selectedRecipe)
+    setInputTargets(cfg.inputTargets)
+    setRateValue(cfg.rateValue)
+    setRateUnit(cfg.rateUnit)
+    setUserVoltageTier(cfg.userVoltageTier)
+    setMaxCoilType(cfg.maxCoilType)
+    setRecipeTierOverrides(cfg.recipeTierOverrides)
+    setRecipeOverclockTiers(cfg.recipeOverclockTiers)
+    setInputRecipeOverrides(cfg.inputRecipeOverrides)
+    setMachineTierSelections(cfg.machineTierSelections)
+    setShowOutputModal(false)
+    setSelectedOutput(null)
+    setSelectedMachineId(null)
+    setOutputRecipes([])
+    setMachinesForOutput([])
+    setSelectionMode("output")
+    setConfigTab("outputs")
+    setGraphTab("graph")
+    lastTargetRatePerSRef.current = getRatePerS(cfg.rateValue, cfg.rateUnit)
+    setGraph(null)
+    setError(null)
+    window.setTimeout(() => {
+      isRestoringConfigRef.current = false
+      runGraph()
+    }, 0)
+  }
+
+  const saveCurrentConfig = () => {
+    if (!outputTarget || !selectedRecipe) {
+      setError("Select an output before saving a configuration.")
+      return
+    }
+    const name = configName.trim() || `${formatTargetName(outputTarget)} Line`
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const config: SavedConfig = {
+      outputTarget,
+      selectedRecipe,
+      inputTargets,
+      rateValue,
+      rateUnit,
+      userVoltageTier,
+      maxCoilType,
+      recipeTierOverrides,
+      recipeOverclockTiers,
+      inputRecipeOverrides,
+      machineTierSelections
+    }
+    setSavedConfigs(prev => [
+      { id, name, savedAt: new Date().toISOString(), config },
+      ...prev
+    ])
+    setConfigName("")
+  }
+
+  const deleteConfig = (id: string) => {
+    setSavedConfigs(prev => prev.filter(entry => entry.id !== id))
+  }
+
+  const buildSvgWithFooter = () => {
+    if (!cyRef.current) return null
+    const rawSvg = cyRef.current.svg({
+      full: true,
+      scale: 1,
+      bg: "#161311"
+    })
+    const parser = new DOMParser()
+    const doc = parser.parseFromString(rawSvg, "image/svg+xml")
+    const svg = doc.documentElement as SVGSVGElement
+    const parseSize = (value: string | null) => (value ? Number.parseFloat(value) : 0)
+    let width = parseSize(svg.getAttribute("width"))
+    let height = parseSize(svg.getAttribute("height"))
+    const viewBox = svg.getAttribute("viewBox")
+    let viewBoxParts: number[] | null = null
+    if (viewBox) {
+      const parts = viewBox.split(/\s+/).map(part => Number.parseFloat(part))
+      if (parts.length === 4 && parts.every(Number.isFinite)) {
+        viewBoxParts = parts
+        width = width || parts[2]
+        height = height || parts[3]
+      }
+    }
+    if (!width || !height) {
+      width = width || cyRef.current.width()
+      height = height || cyRef.current.height()
+    }
+    const footerHeight = 56
+    const nextHeight = height + footerHeight
+    svg.setAttribute("width", `${width}`)
+    svg.setAttribute("height", `${nextHeight}`)
+    if (viewBoxParts) {
+      const [minX, minY, vbWidth, vbHeight] = viewBoxParts
+      svg.setAttribute("viewBox", `${minX} ${minY} ${vbWidth} ${vbHeight + footerHeight}`)
+    } else {
+      svg.setAttribute("viewBox", `0 0 ${width} ${nextHeight}`)
+    }
+
+    const footer = getFooterSegments()
+    const ns = "http://www.w3.org/2000/svg"
+    const footerGroup = doc.createElementNS(ns, "g")
+    footerGroup.setAttribute("data-role", "footer")
+    footerGroup.setAttribute("transform", `translate(0 ${height})`)
+
+    const footerRect = doc.createElementNS(ns, "rect")
+    footerRect.setAttribute("x", "0")
+    footerRect.setAttribute("y", "0")
+    footerRect.setAttribute("width", `${width}`)
+    footerRect.setAttribute("height", `${footerHeight}`)
+    footerRect.setAttribute("fill", "#211b16")
+    footerGroup.appendChild(footerRect)
+
+    const makeFooterText = (value: string, x: number, anchor: "start" | "middle" | "end", color: string) => {
+      const text = doc.createElementNS(ns, "text")
+      text.textContent = value
+      text.setAttribute("x", `${x}`)
+      text.setAttribute("y", `${footerHeight / 2}`)
+      text.setAttribute("fill", color)
+      text.setAttribute("font-family", "'Space Grotesk', sans-serif")
+      text.setAttribute("font-size", "14")
+      text.setAttribute("font-weight", "600")
+      text.setAttribute("dominant-baseline", "middle")
+      text.setAttribute("text-anchor", anchor)
+      footerGroup.appendChild(text)
+    }
+
+    makeFooterText(footer.left, 18, "start", "#f4efe6")
+    makeFooterText(footer.middle, width / 2, "middle", "#bcae9a")
+    makeFooterText(footer.right, width - 18, "end", "#bcae9a")
+    svg.appendChild(footerGroup)
+
+    const svgText = new XMLSerializer().serializeToString(svg)
+    return { svgText, width, height: nextHeight }
+  }
+
+  const renderGraphWithFooter = async () => {
+    if (!cyRef.current) return null
+    const pngData = cyRef.current.png({
+      full: true,
+      scale: 2,
+      bg: "#161311"
+    })
+    const image = new Image()
+    const footerHeight = 56
+    const footer = getFooterSegments()
+    return new Promise<HTMLCanvasElement>((resolve, reject) => {
+      image.onload = () => {
+        const canvas = document.createElement("canvas")
+        canvas.width = image.width
+        canvas.height = image.height + footerHeight
+        const ctx = canvas.getContext("2d")
+        if (!ctx) {
+          reject(new Error("Canvas not supported"))
+          return
+        }
+        ctx.drawImage(image, 0, 0)
+        ctx.fillStyle = "#211b16"
+        ctx.fillRect(0, image.height, canvas.width, footerHeight)
+        ctx.fillStyle = "#bcae9a"
+        ctx.font = "600 14px 'Space Grotesk', sans-serif"
+        ctx.textBaseline = "middle"
+        ctx.fillStyle = "#f4efe6"
+        ctx.textAlign = "left"
+        ctx.fillText(footer.left, 18, image.height + footerHeight / 2)
+        ctx.fillStyle = "#bcae9a"
+        ctx.textAlign = "center"
+        ctx.fillText(footer.middle, canvas.width / 2, image.height + footerHeight / 2)
+        ctx.textAlign = "right"
+        ctx.fillText(footer.right, canvas.width - 18, image.height + footerHeight / 2)
+        resolve(canvas)
+      }
+      image.onerror = () => reject(new Error("Failed to render image"))
+      image.src = pngData
+    })
+  }
+
+  const downloadBlob = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement("a")
+    link.href = url
+    link.download = filename
+    link.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const copyGraphImage = async () => {
+    try {
+      const canvas = await renderGraphWithFooter()
+      if (!canvas) return
+      const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, "image/png"))
+      if (!blob) return
+      if (navigator.clipboard && "write" in navigator.clipboard) {
+        const item = new ClipboardItem({ "image/png": blob })
+        await navigator.clipboard.write([item])
+      } else {
+        downloadBlob(blob, "gtnh-graph.png")
+      }
+    } catch (err) {
+      setError("Failed to copy graph image.")
+    }
+  }
+
+  const downloadSvg = async () => {
+    try {
+      const svgPayload = buildSvgWithFooter()
+      if (!svgPayload) return
+      const blob = new Blob([svgPayload.svgText], { type: "image/svg+xml" })
+      downloadBlob(blob, "gtnh-graph.svg")
+    } catch (err) {
+      setError("Failed to export SVG.")
+    }
+  }
+
+  const downloadPdf = async () => {
+    try {
+      const svgPayload = buildSvgWithFooter()
+      if (!svgPayload) return
+      const wrapper = document.createElement("div")
+      wrapper.style.position = "fixed"
+      wrapper.style.left = "-99999px"
+      wrapper.style.top = "-99999px"
+      wrapper.style.width = "0"
+      wrapper.style.height = "0"
+      wrapper.innerHTML = svgPayload.svgText
+      const svgElement = wrapper.querySelector("svg")
+      if (!svgElement) {
+        throw new Error("SVG export failed")
+      }
+      document.body.appendChild(wrapper)
+      try {
+        const pdf = new jsPDF({
+          unit: "pt",
+          format: [svgPayload.width, svgPayload.height]
+        })
+        await svg2pdf(svgElement, pdf, {
+          xOffset: 0,
+          yOffset: 0,
+          scale: 1
+        })
+        const pdfBlob = pdf.output("blob")
+        downloadBlob(pdfBlob, "gtnh-graph.pdf")
+      } finally {
+        wrapper.remove()
+      }
+    } catch (err) {
+      setError("Failed to export PDF.")
+    }
+  }
 
   const machineGroups = useMemo(() => {
     const groups = new Map<string, { machine_id: string; machine_name: string; recipes: RecipeOption[] }>()
@@ -1129,6 +1437,17 @@ export default function App() {
             >
               Machines
             </button>
+            <div className="graph-actions">
+              <button className="ghost" onClick={copyGraphImage}>
+                Copy image
+              </button>
+              <button className="ghost" onClick={downloadSvg}>
+                Export SVG
+              </button>
+              <button className="ghost" onClick={downloadPdf}>
+                Export PDF
+              </button>
+            </div>
           </div>
           <div className="panel-body">
             <div className={`graph-section ${graphTab === "graph" ? "" : "is-hidden"}`}>
@@ -1220,6 +1539,12 @@ export default function App() {
               onClick={() => setConfigTab("options")}
             >
               Options
+            </button>
+            <button
+              className={configTab === "saved" ? "active" : ""}
+              onClick={() => setConfigTab("saved")}
+            >
+              Saved
             </button>
           </div>
           <div className="panel-body">
@@ -1499,6 +1824,40 @@ export default function App() {
                 </select>
               </label>
               <button onClick={runGraph}>Build graph</button>
+            </div>
+            <div className={`saved-panel ${configTab === "saved" ? "" : "is-hidden"}`}>
+              <label>
+                Save current configuration
+                <input
+                  placeholder="Name this configuration"
+                  value={configName}
+                  onChange={e => setConfigName(e.target.value)}
+                />
+              </label>
+              <button onClick={saveCurrentConfig} disabled={!outputTarget || !selectedRecipe}>
+                Save configuration
+              </button>
+              {savedConfigs.length === 0 && <p className="empty">No saved configurations yet.</p>}
+              {savedConfigs.length > 0 && (
+                <div className="saved-list">
+                  {savedConfigs.map(entry => (
+                    <div key={entry.id} className="saved-card">
+                      <div>
+                        <strong>{entry.name}</strong>
+                        <small>{new Date(entry.savedAt).toLocaleString()}</small>
+                      </div>
+                      <div className="saved-actions">
+                        <button className="ghost" onClick={() => restoreConfig(entry)}>
+                          Load
+                        </button>
+                        <button className="ghost danger" onClick={() => deleteConfig(entry.id)}>
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </aside>

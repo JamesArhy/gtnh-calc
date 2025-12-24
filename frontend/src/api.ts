@@ -1,11 +1,14 @@
 import type { GraphResponse } from "./types"
 
+const API_BASE = import.meta.env.VITE_API_BASE ?? ""
+const apiUrl = (path: string) => `${API_BASE}${path}`
+
 export async function searchItems(query: string, limit?: number) {
   const params = new URLSearchParams({ q: query })
   if (limit) {
     params.set("limit", String(limit))
   }
-  const res = await fetch(`/api/search/items?${params.toString()}`)
+  const res = await fetch(apiUrl(`/api/search/items?${params.toString()}`))
   return res.json()
 }
 
@@ -14,12 +17,12 @@ export async function searchFluids(query: string, limit?: number) {
   if (limit) {
     params.set("limit", String(limit))
   }
-  const res = await fetch(`/api/search/fluids?${params.toString()}`)
+  const res = await fetch(apiUrl(`/api/search/fluids?${params.toString()}`))
   return res.json()
 }
 
 export async function fetchGraph(payload: unknown): Promise<GraphResponse> {
-  const res = await fetch("/api/graph", {
+  const res = await fetch(apiUrl("/api/graph"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
@@ -44,7 +47,7 @@ export async function fetchRecipesByOutput(params: {
   if (params.fluid_id) query.set("fluid_id", params.fluid_id)
   if (params.machine_id) query.set("machine_id", params.machine_id)
   if (params.limit) query.set("limit", String(params.limit))
-  const res = await fetch(`/api/recipes/by-output?${query.toString()}`)
+  const res = await fetch(apiUrl(`/api/recipes/by-output?${query.toString()}`))
   return res.json()
 }
 
@@ -60,6 +63,6 @@ export async function fetchMachinesByOutput(params: {
   if (params.meta !== undefined) query.set("meta", String(params.meta))
   if (params.fluid_id) query.set("fluid_id", params.fluid_id)
   if (params.limit) query.set("limit", String(params.limit))
-  const res = await fetch(`/api/machines/by-output?${query.toString()}`)
+  const res = await fetch(apiUrl(`/api/machines/by-output?${query.toString()}`))
   return res.json()
 }

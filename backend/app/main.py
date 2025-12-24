@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -34,10 +35,25 @@ app = FastAPI(title="GTNH Production Planner API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_and_cors(request: Request, call_next):
+    response = await call_next(request)
+    origin = request.headers.get("origin")
+    if origin:
+        response.headers.setdefault("Access-Control-Allow-Origin", origin)
+        response.headers.setdefault("Vary", "Origin")
+    else:
+        response.headers.setdefault("Access-Control-Allow-Origin", "*")
+    response.headers.setdefault("Access-Control-Allow-Methods", "*")
+    response.headers.setdefault("Access-Control-Allow-Headers", "*")
+    print(f"{request.method} {request.url.path} -> {response.status_code}")
+    return response
 
 
 class GraphTargetModel(BaseModel):
@@ -390,4 +406,5 @@ if static_dir.exists():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("GTNH_API_PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
