@@ -54,6 +54,7 @@ def load_name_index(recipes_json: Path) -> NameIndex:
                     "min_tier": recipe.get("minTier"),
                     "min_voltage": recipe.get("minVoltage"),
                     "amps": recipe.get("ampsAtMinTier"),
+                    "ebf_temp": recipe.get("ebfTemp"),
                 }
             for entry in recipe.get("itemInputs", []) + recipe.get("itemOutputs", []):
                 item_id = entry.get("id")

@@ -11,6 +11,7 @@ from .config import load_settings
 from .data_source import LocalDataSource, S3DataSource
 from .gtnh import MachineTuning
 from .graph import GraphRequest, GraphTarget, build_graph
+from .graph_store import create_graph_store
 from .name_index import load_name_index
 
 settings = load_settings()
@@ -23,6 +24,11 @@ else:
     raise RuntimeError(f"Unsupported data source: {settings.data_source}")
 
 name_index = load_name_index(settings.recipes_json)
+graph_store = None
+if settings.data_source == "local":
+    graph_store = create_graph_store(settings.graph_backend, settings.local_data_dir)
+    if graph_store:
+        graph_store.wait_until_ready()
 
 app = FastAPI(title="GTNH Production Planner API")
 app.add_middleware(
@@ -62,9 +68,13 @@ def list_versions():
 
 @app.get("/api/search/items")
 def search_items(q: str, limit: int = 20, version: str | None = None):
-    dataset = data_source.open_dataset(version or settings.default_version)
-    results = dataset.list_item_matches(q, limit)
-    dataset.close()
+    if graph_store:
+        graph_store.wait_until_ready()
+        results = graph_store.search_items(q, limit)
+    else:
+        dataset = data_source.open_dataset(version or settings.default_version)
+        results = dataset.list_item_matches(q, limit)
+        dataset.close()
 
     if q and len(results) < limit:
         q_lower = q.lower()
@@ -85,9 +95,13 @@ def search_items(q: str, limit: int = 20, version: str | None = None):
 
 @app.get("/api/search/fluids")
 def search_fluids(q: str, limit: int = 20, version: str | None = None):
-    dataset = data_source.open_dataset(version or settings.default_version)
-    results = dataset.list_fluid_matches(q, limit)
-    dataset.close()
+    if graph_store:
+        graph_store.wait_until_ready()
+        results = graph_store.search_fluids(q, limit)
+    else:
+        dataset = data_source.open_dataset(version or settings.default_version)
+        results = dataset.list_fluid_matches(q, limit)
+        dataset.close()
 
     if q and len(results) < limit:
         q_lower = q.lower()
@@ -116,64 +130,85 @@ def recipes_by_output(
     limit: int = 10,
     version: str | None = None,
 ):
-    dataset = data_source.open_dataset(version or settings.default_version)
-    if output_type == "item" and item_id:
-        if machine_id:
-            recipes = dataset.recipes_for_output_item_by_machine(item_id, meta, machine_id, limit)
+    dataset = None
+    try:
+        recipes = None
+        if output_type == "item" and item_id:
+            if graph_store:
+                graph_store.wait_until_ready()
+                recipes = graph_store.recipes_by_output_item(item_id, meta, limit, machine_id)
+            else:
+                dataset = data_source.open_dataset(version or settings.default_version)
+                if machine_id:
+                    recipes = dataset.recipes_for_output_item_by_machine(item_id, meta, machine_id, limit)
+                else:
+                    recipes = dataset.recipes_for_output_item(item_id, meta, limit)
+        elif output_type == "fluid" and fluid_id:
+            if graph_store:
+                graph_store.wait_until_ready()
+                recipes = graph_store.recipes_by_output_fluid(fluid_id, limit, machine_id)
+            else:
+                dataset = data_source.open_dataset(version or settings.default_version)
+                if machine_id:
+                    recipes = dataset.recipes_for_output_fluid_by_machine(fluid_id, machine_id, limit)
+                else:
+                    recipes = dataset.recipes_for_output_fluid(fluid_id, limit)
         else:
-            recipes = dataset.recipes_for_output_item(item_id, meta, limit)
-    elif output_type == "fluid" and fluid_id:
-        if machine_id:
-            recipes = dataset.recipes_for_output_fluid_by_machine(fluid_id, machine_id, limit)
-        else:
-            recipes = dataset.recipes_for_output_fluid(fluid_id, limit)
-    else:
-        dataset.close()
-        raise HTTPException(status_code=400, detail="Invalid output selector")
-    enriched = []
-    for recipe in recipes:
-        info = name_index.recipes.get(recipe["rid"], {})
-        inputs = dataset.recipe_inputs(recipe["rid"])
-        outputs = dataset.recipe_outputs(recipe["rid"])
-        enriched.append(
-            {
-                **recipe,
-                "machine_name": info.get("machine_name") or recipe.get("machine_id"),
-                "min_tier": info.get("min_tier"),
-                "min_voltage": info.get("min_voltage"),
-                "amps": info.get("amps"),
-                "item_inputs": [
-                    {
-                        **item,
-                        "name": name_index.items.get((item["item_id"], item["meta"])),
-                    }
-                    for item in inputs["items"]
-                ],
-                "fluid_inputs": [
-                    {
-                        **fluid,
-                        "name": name_index.fluids.get(fluid["fluid_id"]),
-                    }
-                    for fluid in inputs["fluids"]
-                ],
-                "item_outputs": [
-                    {
-                        **item,
-                        "name": name_index.items.get((item["item_id"], item["meta"])),
-                    }
-                    for item in outputs["items"]
-                ],
-                "fluid_outputs": [
-                    {
-                        **fluid,
-                        "name": name_index.fluids.get(fluid["fluid_id"]),
-                    }
-                    for fluid in outputs["fluids"]
-                ],
-            }
-        )
-    dataset.close()
-    return {"recipes": enriched}
+            raise HTTPException(status_code=400, detail="Invalid output selector")
+
+        if recipes is None:
+            raise HTTPException(status_code=400, detail="Invalid output selector")
+
+        if dataset is None:
+            dataset = data_source.open_dataset(version or settings.default_version)
+
+        enriched = []
+        for recipe in recipes:
+            info = name_index.recipes.get(recipe["rid"], {})
+            inputs = dataset.recipe_inputs(recipe["rid"])
+            outputs = dataset.recipe_outputs(recipe["rid"])
+            enriched.append(
+                {
+                    **recipe,
+                    "machine_name": info.get("machine_name") or recipe.get("machine_id"),
+                    "min_tier": info.get("min_tier"),
+                    "min_voltage": info.get("min_voltage"),
+                    "amps": info.get("amps"),
+                    "ebf_temp": info.get("ebf_temp"),
+                    "item_inputs": [
+                        {
+                            **item,
+                            "name": name_index.items.get((item["item_id"], item["meta"])),
+                        }
+                        for item in inputs["items"]
+                    ],
+                    "fluid_inputs": [
+                        {
+                            **fluid,
+                            "name": name_index.fluids.get(fluid["fluid_id"]),
+                        }
+                        for fluid in inputs["fluids"]
+                    ],
+                    "item_outputs": [
+                        {
+                            **item,
+                            "name": name_index.items.get((item["item_id"], item["meta"])),
+                        }
+                        for item in outputs["items"]
+                    ],
+                    "fluid_outputs": [
+                        {
+                            **fluid,
+                            "name": name_index.fluids.get(fluid["fluid_id"]),
+                        }
+                        for fluid in outputs["fluids"]
+                    ],
+                }
+            )
+        return {"recipes": enriched}
+    finally:
+        if dataset is not None:
+            dataset.close()
 
 
 @app.get("/api/machines/by-output")
@@ -185,22 +220,37 @@ def machines_by_output(
     limit: int = 200,
     version: str | None = None,
 ):
-    dataset = data_source.open_dataset(version or settings.default_version)
+    machine_rows = None
     if output_type == "item" and item_id:
-        machine_ids = dataset.machines_for_output_item(item_id, meta, limit)
+        if graph_store:
+            graph_store.wait_until_ready()
+            machine_rows = graph_store.machine_counts_by_output_item(item_id, meta, limit)
+        else:
+            dataset = data_source.open_dataset(version or settings.default_version)
+            machine_rows = dataset.machine_recipe_counts_for_output_item(item_id, meta, limit)
+            dataset.close()
     elif output_type == "fluid" and fluid_id:
-        machine_ids = dataset.machines_for_output_fluid(fluid_id, limit)
+        if graph_store:
+            graph_store.wait_until_ready()
+            machine_rows = graph_store.machine_counts_by_output_fluid(fluid_id, limit)
+        else:
+            dataset = data_source.open_dataset(version or settings.default_version)
+            machine_rows = dataset.machine_recipe_counts_for_output_fluid(fluid_id, limit)
+            dataset.close()
     else:
-        dataset.close()
         raise HTTPException(status_code=400, detail="Invalid output selector")
-    dataset.close()
-    machines = [
-        {
-            "machine_id": machine_id,
-            "machine_name": name_index.machine_names.get(machine_id, machine_id),
-        }
-        for machine_id in machine_ids
-    ]
+
+    machines = []
+    for row in machine_rows or []:
+        machine_id = row.get("machine_id")
+        recipe_count = row.get("recipe_count")
+        machines.append(
+            {
+                "machine_id": machine_id,
+                "machine_name": name_index.machine_names.get(machine_id, machine_id),
+                "recipe_count": int(recipe_count) if recipe_count is not None else None,
+            }
+        )
     return {"machines": machines}
 
 
@@ -267,6 +317,7 @@ def recipes_by_machine(
                 "min_tier": info.get("min_tier"),
                 "min_voltage": info.get("min_voltage"),
                 "amps": info.get("amps"),
+                "ebf_temp": info.get("ebf_temp"),
                 "item_inputs": [
                     {
                         **item,

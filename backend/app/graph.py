@@ -80,7 +80,8 @@ def build_graph(dataset: DuckDBDataset, names: NameIndex, req: GraphRequest) -> 
         node_id = _recipe_key(recipe["rid"], output_key)
         if node_id not in nodes:
             duration_ticks, eut = apply_overclock(recipe["duration_ticks"], recipe["eut"], tuning)
-            machine_name = names.recipes.get(recipe["rid"], {}).get("machine_name") or recipe["machine_id"]
+            recipe_info = names.recipes.get(recipe["rid"], {})
+            machine_name = recipe_info.get("machine_name") or recipe["machine_id"]
             nodes[node_id] = {
                 "id": node_id,
                 "type": "recipe",
@@ -88,6 +89,9 @@ def build_graph(dataset: DuckDBDataset, names: NameIndex, req: GraphRequest) -> 
                 "rid": recipe["rid"],
                 "machine_id": recipe["machine_id"],
                 "machine_name": machine_name,
+                "min_tier": recipe_info.get("min_tier"),
+                "base_duration_ticks": recipe["duration_ticks"],
+                "base_eut": recipe["eut"],
                 "duration_ticks": duration_ticks,
                 "eut": eut,
                 "overclock_tiers": tuning.overclock_tiers,

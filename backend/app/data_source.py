@@ -287,6 +287,53 @@ class DuckDBDataset:
         ).fetchall()
         return [row[0] for row in rows]
 
+    def machine_recipe_counts_for_output_item(
+        self, item_id: str, meta: int, limit: int = 200
+    ) -> list[dict]:
+        sql = """
+            select r.machine_id, count(distinct r.rid) as recipe_count
+            from read_parquet(?) r
+            join read_parquet(?) o
+            on r.rid = o.rid
+            where o.item_id = ? and o.meta = ?
+            group by r.machine_id
+            order by r.machine_id
+            limit ?
+        """
+        rows = self.con.execute(
+            sql,
+            [
+                str(self.data_dir / "recipes.parquet"),
+                str(self.data_dir / "item_outputs.parquet"),
+                item_id,
+                int(meta),
+                int(limit),
+            ],
+        ).fetchall()
+        return [{"machine_id": row[0], "recipe_count": int(row[1])} for row in rows]
+
+    def machine_recipe_counts_for_output_fluid(self, fluid_id: str, limit: int = 200) -> list[dict]:
+        sql = """
+            select r.machine_id, count(distinct r.rid) as recipe_count
+            from read_parquet(?) r
+            join read_parquet(?) o
+            on r.rid = o.rid
+            where o.fluid_id = ?
+            group by r.machine_id
+            order by r.machine_id
+            limit ?
+        """
+        rows = self.con.execute(
+            sql,
+            [
+                str(self.data_dir / "recipes.parquet"),
+                str(self.data_dir / "fluid_outputs.parquet"),
+                fluid_id,
+                int(limit),
+            ],
+        ).fetchall()
+        return [{"machine_id": row[0], "recipe_count": int(row[1])} for row in rows]
+
     def list_machines(self) -> list[str]:
         sql = """
             select distinct machine_id

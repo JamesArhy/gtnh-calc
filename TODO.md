@@ -1,0 +1,1 @@
+- Add export options (svg pdf, clipboard)

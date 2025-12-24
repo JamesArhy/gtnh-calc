@@ -42,7 +42,9 @@ Environment variables (backend):
 - `LOCAL_DATA_DIR=in/parquet`
 - `RECIPES_JSON=in/recipes.json`
 - `DEFAULT_VERSION=local`
+- `GRAPH_DB=ladybugdb` (default; options: `ladybugdb`, `real-ladybug`, `duckdb`/`off`)
 
 Notes:
 - The backend reads Parquet directly with DuckDB. A name index is built from `recipes.json`.
 - S3 support is stubbed; switch `DATA_SOURCE=s3` once implemented.
+- `GRAPH_DB=ladybugdb` runs Cypher queries on a real-ladybug graph instance (install required). Use `GRAPH_DB=off` to stick with DuckDB only.

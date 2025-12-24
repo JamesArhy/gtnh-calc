@@ -2,3 +2,4 @@ fastapi==0.112.2
 uvicorn==0.30.6
 duckdb==1.1.2
 pydantic==2.9.2
+real-ladybug==0.13.0
