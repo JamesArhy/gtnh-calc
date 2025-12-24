@@ -133,7 +133,7 @@ export default function App() {
   const [graphTab, setGraphTab] = useState<"graph" | "machines">("graph")
   const [configTab, setConfigTab] = useState<"outputs" | "inputs" | "options" | "saved">("outputs")
 
-  const [showOutputModal, setShowOutputModal] = useState(true)
+  const [showOutputModal, setShowOutputModal] = useState(false)
   const [outputQuery, setOutputQuery] = useState("")
   const [outputResults, setOutputResults] = useState<Target[]>([])
   const [selectedOutput, setSelectedOutput] = useState<Target | null>(null)
@@ -143,6 +143,18 @@ export default function App() {
   const [isLoadingMachines, setIsLoadingMachines] = useState(false)
   const [isLoadingRecipes, setIsLoadingRecipes] = useState(false)
   const [machinesForOutput, setMachinesForOutput] = useState<MachineOption[]>([])
+  const [recentRecipes, setRecentRecipes] = useState<{ target: Target; recipe: RecipeOption }[]>(() => {
+    const key = "gtnh_recent_recipes_v1"
+    try {
+      const raw = window.localStorage.getItem(key)
+      if (!raw) return []
+      const parsed = JSON.parse(raw)
+      return Array.isArray(parsed) ? parsed.slice(0, 5) : []
+    } catch (err) {
+      console.warn("Failed to load recent recipes", err)
+      return []
+    }
+  })
   const [recipeQuery, setRecipeQuery] = useState("")
   const [hoverInfo, setHoverInfo] = useState<{
     x: number
@@ -151,10 +163,22 @@ export default function App() {
   } | null>(null)
   const graphRunTimerRef = useRef<number | null>(null)
   const isRestoringConfigRef = useRef(false)
+  const [restoreVersion, setRestoreVersion] = useState(0)
   const [selectionMode, setSelectionMode] = useState<"output" | "input">("output")
   const [pendingInputRate, setPendingInputRate] = useState<number | null>(null)
   const [machineTierSelections, setMachineTierSelections] = useState<Record<string, string>>({})
-  const [savedConfigs, setSavedConfigs] = useState<SavedConfigEntry[]>([])
+  const [savedConfigs, setSavedConfigs] = useState<SavedConfigEntry[]>(() => {
+    const key = "gtnh_saved_configs_v1"
+    try {
+      const raw = window.localStorage.getItem(key)
+      if (!raw) return []
+      const parsed = JSON.parse(raw)
+      return Array.isArray(parsed) ? parsed : []
+    } catch (err) {
+      console.warn("Failed to load saved configs", err)
+      return []
+    }
+  })
   const [configName, setConfigName] = useState("")
 
   const getTargetKey = (target: Target) =>
@@ -409,12 +433,25 @@ export default function App() {
 
   const getRecipeEnergy = (recipe: RecipeOption) => recipe.duration_ticks * recipe.eut
   const getRatePerS = (value: number, unit: "min" | "sec") => (unit === "min" ? value / 60 : value)
+  const formatRateNumber = (value: number, decimals: number) => {
+    const fixed = value.toFixed(decimals)
+    return fixed.replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1")
+  }
   const formatItemRate = (ratePerS: number) =>
-    rateUnit === "min" ? `${(ratePerS * 60).toFixed(2)} /min` : `${ratePerS.toFixed(2)} /s`
+    rateUnit === "min"
+      ? `${formatRateNumber(ratePerS * 60, 2)} /min`
+      : `${formatRateNumber(ratePerS, 2)} /s`
   const formatFluidRate = (ratePerS: number) => {
     const liters = rateUnit === "min" ? ratePerS * 60 : ratePerS
+    if (liters >= 1000) {
+      const kLiters = liters / 1000
+      const unit = rateUnit === "min" ? "kL/min" : "kL/s"
+      const decimals = kLiters >= 10 ? 1 : 2
+      return `${formatRateNumber(kLiters, decimals)} ${unit}`
+    }
     const unit = rateUnit === "min" ? "L/min" : "L/s"
-    return `${liters.toFixed(liters >= 10 ? 1 : 2)} ${unit}`
+    const decimals = liters >= 10 ? 1 : 2
+    return `${formatRateNumber(liters, decimals)} ${unit}`
   }
 
   const getFooterSegments = () => ({
@@ -518,6 +555,13 @@ export default function App() {
     if (!outputTarget || !selectedRecipe) return
     runGraph()
   }, [outputTarget, selectedRecipe])
+
+  useEffect(() => {
+    if (!outputTarget || !selectedRecipe) return
+    if (isRestoringConfigRef.current) return
+    if (restoreVersion === 0) return
+    runGraph()
+  }, [restoreVersion])
 
   const scheduleGraphRun = (delay = 80) => {
     if (!outputTarget || !selectedRecipe) return
@@ -853,25 +897,20 @@ export default function App() {
   useEffect(() => {
     const key = "gtnh_saved_configs_v1"
     try {
-      const raw = window.localStorage.getItem(key)
-      if (!raw) return
-      const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed)) {
-        setSavedConfigs(parsed)
-      }
-    } catch (err) {
-      console.warn("Failed to load saved configs", err)
-    }
-  }, [])
-
-  useEffect(() => {
-    const key = "gtnh_saved_configs_v1"
-    try {
       window.localStorage.setItem(key, JSON.stringify(savedConfigs))
     } catch (err) {
       console.warn("Failed to save configs", err)
     }
   }, [savedConfigs])
+
+  useEffect(() => {
+    const key = "gtnh_recent_recipes_v1"
+    try {
+      window.localStorage.setItem(key, JSON.stringify(recentRecipes))
+    } catch (err) {
+      console.warn("Failed to save recent recipes", err)
+    }
+  }, [recentRecipes])
 
   const recipeStats = useMemo(() => {
     if (!graph) return []
@@ -924,7 +963,7 @@ export default function App() {
     setError(null)
     window.setTimeout(() => {
       isRestoringConfigRef.current = false
-      runGraph()
+      setRestoreVersion(prev => prev + 1)
     }, 0)
   }
 
@@ -1171,7 +1210,6 @@ export default function App() {
     setMachinesForOutput([])
     setInputTargets([])
     setInputRecipeOverrides({})
-    setShowOutputModal(true)
   }, [outputTarget])
 
   useEffect(() => {
@@ -1283,6 +1321,13 @@ export default function App() {
     setSelectionMode("output")
     setConfigTab("outputs")
     setGraphTab("graph")
+    setRecentRecipes(prev => {
+      const key = `${getTargetKey(nextTarget)}:${recipe.rid}`
+      const filtered = prev.filter(
+        entry => `${getTargetKey(entry.target)}:${entry.recipe.rid}` !== key
+      )
+      return [{ target: { ...nextTarget }, recipe: { ...recipe } }, ...filtered].slice(0, 5)
+    })
   }
 
   const getInputRateForTarget = (target: Target, recipeRid?: string, recipeOutputKey?: string) => {
@@ -1462,7 +1507,7 @@ export default function App() {
                   ))}
                 </div>
               )}
-              {!graph && <p className="graph-empty">Select an output to build the graph.</p>}
+              {!graph && <p className="graph-empty">Select an output or load a saved configuration.</p>}
             </div>
             {graphTab === "graph" && (
               <div className="viz-footer">
@@ -1549,7 +1594,7 @@ export default function App() {
           </div>
           <div className="panel-body">
             <div className={`output-panel ${configTab === "outputs" ? "" : "is-hidden"}`}>
-              {!outputTarget && <p className="empty">No output selected.</p>}
+              {!outputTarget && <p className="empty">No output selected. Choose an output or load a saved config.</p>}
               {outputTarget && (
                 <div className="output-summary">
                   <strong>{formatTargetName(outputTarget)}</strong>
@@ -1885,6 +1930,47 @@ export default function App() {
                   onChange={e => setOutputQuery(e.target.value)}
                 />
                 {isLoadingOutputs && <p className="empty">Searching outputs...</p>}
+                {selectionMode === "output" && recentRecipes.length > 0 && (
+                  <div className="recent-outputs">
+                    <p className="modal-label">Recent recipes</p>
+                    <div className="output-results">
+                      {recentRecipes.map(entry => (
+                        <div
+                          key={`recent:${getTargetKey(entry.target)}:${entry.recipe.rid}`}
+                          className="output-result recent-recipe"
+                        >
+                          <div className="recent-recipe-info">
+                            <span>{formatTargetName(entry.target)}</span>
+                            <small>
+                              {entry.target.type === "item" ? `meta ${entry.target.meta}` : "fluid"} •{" "}
+                              {(entry.recipe.machine_name || entry.recipe.machine_id)} •{" "}
+                              {(entry.recipe.rid || "").split(":").pop()}
+                            </small>
+                          </div>
+                          <div className="recent-recipe-actions">
+                            <button
+                              className="ghost"
+                              onClick={() => applyOutputSelection(entry.target, entry.recipe)}
+                            >
+                              Use recipe
+                            </button>
+                            <button
+                              className="ghost"
+                              onClick={() => {
+                                setSelectedOutput(entry.target)
+                                setSelectedMachineId(null)
+                                setOutputRecipes([])
+                                setMachinesForOutput([])
+                              }}
+                            >
+                              Pick output
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <div className="output-results">
                   {outputResults.map(result => (
                     <button

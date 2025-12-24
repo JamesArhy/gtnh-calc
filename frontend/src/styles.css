@@ -795,6 +795,26 @@ label {
   background: #2f2720;
   color: var(--text);
   border: 1px solid #4a3b2e;
+  padding: 10px 12px;
+  border-radius: 10px;
+  width: 100%;
+}
+
+.recent-recipe {
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.recent-recipe-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.recent-recipe-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .selected-output {
