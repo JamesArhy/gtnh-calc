@@ -13,6 +13,7 @@ const OUTPUT_SEARCH_LIMIT = 30
 const TIERS = ["ULV", "LV", "MV", "HV", "EV", "IV", "LuV", "ZPM", "UV", "UHV"]
 const RECIPE_RESULTS_LIMIT = 200
 const TIER_COLORS: Record<string, string> = {
+  ULV: "#4DBE6B",
   LV: "#4DBE6B",
   MV: "#E4C14A",
   HV: "#E48A3A",
@@ -113,6 +114,7 @@ type SavedConfigEntry = {
 
 export default function App() {
   const containerRef = useRef<HTMLDivElement | null>(null)
+  const graphSectionRef = useRef<HTMLDivElement | null>(null)
   const cyRef = useRef<cytoscape.Core | null>(null)
 
   const [outputTarget, setOutputTarget] = useState<Target | null>(null)
@@ -161,6 +163,25 @@ export default function App() {
     y: number
     lines: string[]
   } | null>(null)
+  const [showFlowAnimation, setShowFlowAnimation] = useState(false)
+  const [radialMenu, setRadialMenu] = useState<
+    | {
+        kind: "target"
+        x: number
+        y: number
+        target: Target
+        isOutput: boolean
+        ratePerS: number | null
+      }
+    | {
+        kind: "recipe"
+        x: number
+        y: number
+        rid: string
+        minTier?: string
+      }
+    | null
+  >(null)
   const graphRunTimerRef = useRef<number | null>(null)
   const isRestoringConfigRef = useRef(false)
   const [restoreVersion, setRestoreVersion] = useState(0)
@@ -333,7 +354,10 @@ export default function App() {
         {
           selector: ".pulse",
           style: {
-            "line-opacity": 1
+            "line-opacity": 1,
+            "line-style": "dashed",
+            "line-dash-pattern": [6, 6],
+            "line-dash-offset": "data(pulse_offset)"
           }
         },
         {
@@ -400,6 +424,27 @@ export default function App() {
     })
   }, [])
 
+  useEffect(() => {
+    const handler = (event: MouseEvent) => {
+      const section = graphSectionRef.current
+      if (!section) return
+      const target = event.target as Node | null
+      const path = typeof event.composedPath === "function" ? event.composedPath() : []
+      const insideSection =
+        (target && section.contains(target)) || (path.length > 0 && path.includes(section))
+      if (insideSection) {
+        event.preventDefault()
+        event.stopPropagation()
+      }
+    }
+    document.addEventListener("contextmenu", handler, { capture: true })
+    window.addEventListener("contextmenu", handler, { capture: true })
+    return () => {
+      document.removeEventListener("contextmenu", handler, { capture: true })
+      window.removeEventListener("contextmenu", handler, { capture: true })
+    }
+  }, [])
+
   const formatMachineMultiplier = (value?: number) => {
     if (value === undefined || Number.isNaN(value)) return "?"
     if (Number.isInteger(value)) return String(value)
@@ -452,6 +497,35 @@ export default function App() {
     const unit = rateUnit === "min" ? "L/min" : "L/s"
     const decimals = liters >= 10 ? 1 : 2
     return `${formatRateNumber(liters, decimals)} ${unit}`
+  }
+  const getTargetForNode = (node: any): Target | null => {
+    if (!node) return null
+    if (node.type === "item") {
+      if (!node.item_id) return null
+      return {
+        type: "item",
+        id: node.item_id,
+        meta: Number.isFinite(node.meta) ? node.meta : 0,
+        name: node.label || node.item_id
+      }
+    }
+    if (node.type === "fluid" || node.type === "gas") {
+      if (!node.fluid_id) return null
+      return {
+        type: "fluid",
+        id: node.fluid_id,
+        meta: 0,
+        name: formatFluidName(node.label, node.fluid_id)
+      }
+    }
+    return null
+  }
+  const getInputRateForNodeId = (nodeId: string) => {
+    if (!graph) return null
+    const total = graph.edges
+      .filter(edge => edge.source === nodeId && edge.kind === "consumes")
+      .reduce((sum, edge) => sum + edge.rate_per_s, 0)
+    return total > 0 ? total : null
   }
 
   const getFooterSegments = () => ({
@@ -672,12 +746,13 @@ export default function App() {
       return base
     }
 
-    const getEdgeWidth = (ratePerS: number) => {
+    const getEdgeWidth = (ratePerS: number, isFluid: boolean) => {
       const ratePerMin = ratePerS * 60
-      if (ratePerMin <= 0.25) return 1
-      if (ratePerMin <= 1) return 2.5
-      if (ratePerMin <= 4) return 4
-      if (ratePerMin <= 16) return 6
+      const normalized = isFluid ? ratePerMin / 1000 : ratePerMin
+      if (normalized <= 0.25) return 1
+      if (normalized <= 1) return 2.5
+      if (normalized <= 4) return 4
+      if (normalized <= 16) return 6
       return 6
     }
 
@@ -721,7 +796,14 @@ export default function App() {
             const isFluid = source?.type === "fluid" || target?.type === "fluid"
             return isFluid ? formatFluidRate(edge.rate_per_s) : formatItemRate(edge.rate_per_s)
           })(),
-          edge_width: getEdgeWidth(edge.rate_per_s),
+          pulse_offset: 0,
+          edge_width: (() => {
+            const source = nodeMap.get(edge.source)
+            const target = nodeMap.get(edge.target)
+            const isFluid = source?.type === "fluid" || target?.type === "fluid"
+            const width = getEdgeWidth(edge.rate_per_s, isFluid)
+            return showFlowAnimation ? Math.min(width, 3.5) : width
+          })(),
           active: activeEdgeIds.has(edge.id) ? "true" : "false",
           bottleneck: (() => {
             if (edge.kind !== "consumes") return "false"
@@ -810,7 +892,7 @@ export default function App() {
     })
     cy.fit(undefined, 30)
     setHoverInfo(null)
-  }, [graph, recipeTierOverrides, selectedRecipe, rateUnit, outputKey, inputTargets])
+  }, [graph, recipeTierOverrides, selectedRecipe, rateUnit, outputKey, inputTargets, showFlowAnimation])
 
   useEffect(() => {
     if (!cyRef.current) return
@@ -856,10 +938,12 @@ export default function App() {
     cy.on("tap", event => {
       if (event.target === cy) {
         clearSelection()
+        setRadialMenu(null)
       }
     })
     cy.on("tap", "node", event => {
       clearSelection()
+      setRadialMenu(null)
       const node = event.target
       node.addClass("selected")
       const upstream = node.predecessors()
@@ -871,28 +955,92 @@ export default function App() {
       downstream.addClass("downstream")
       keep.addClass("path")
     })
+    cy.on("cxttap", "node", event => {
+      const node = event.target
+      const originalEvent = event.originalEvent as MouseEvent | undefined
+      if (originalEvent?.preventDefault) {
+        originalEvent.preventDefault()
+      }
+      if (originalEvent?.stopPropagation) {
+        originalEvent.stopPropagation()
+      }
+      const data = node.data()
+      if (!data) return
+      const rect = containerRef.current?.getBoundingClientRect()
+      const fallbackPos = event.renderedPosition || event.position
+      const x = rect && originalEvent ? originalEvent.clientX - rect.left : fallbackPos.x
+      const y = rect && originalEvent ? originalEvent.clientY - rect.top : fallbackPos.y
+      if (data.type === "recipe" && data.rid) {
+        setRadialMenu({
+          kind: "recipe",
+          x,
+          y,
+          rid: data.rid,
+          minTier: data.min_tier
+        })
+        return
+      }
+      if (!["item", "fluid", "gas"].includes(data.type)) return
+      const target = getTargetForNode(data)
+      if (!target) return
+      const key = getTargetKey(target)
+      if (outputKey && key === outputKey) {
+        setRadialMenu({
+          kind: "target",
+          x,
+          y,
+          target,
+          isOutput: true,
+          ratePerS: null
+        })
+      } else {
+        const rate = getInputRateForNodeId(node.id())
+        setRadialMenu({
+          kind: "target",
+          x,
+          y,
+          target,
+          isOutput: false,
+          ratePerS: rate
+        })
+      }
+    })
 
     return () => {
       cy.removeAllListeners()
     }
-  }, [graph])
+  }, [graph, outputKey])
 
   useEffect(() => {
     if (!cyRef.current || !graph) return
     const cy = cyRef.current
     const edges = cy.edges('[active = "true"]')
     const nodes = cy.nodes('[power_state = "over"]')
-    const edgeTimer = setInterval(() => {
-      edges.toggleClass("pulse")
-    }, 2400)
+    let dashOffset = 0
+    let edgeTimer: number | null = null
+    if (showFlowAnimation) {
+      edges.addClass("pulse")
+      edgeTimer = window.setInterval(() => {
+        if (edges.length === 0) return
+        dashOffset = (dashOffset - 2 + 1000) % 1000
+        cy.batch(() => {
+          edges.data("pulse_offset", dashOffset)
+        })
+      }, 120)
+    } else {
+      edges.removeClass("pulse")
+      edges.data("pulse_offset", 0)
+    }
     const nodeTimer = setInterval(() => {
       nodes.toggleClass("warn-pulse")
     }, 1000)
     return () => {
-      clearInterval(edgeTimer)
+      if (edgeTimer) {
+        clearInterval(edgeTimer)
+      }
       clearInterval(nodeTimer)
     }
-  }, [graph])
+  }, [graph, showFlowAnimation])
 
   useEffect(() => {
     const key = "gtnh_saved_configs_v1"
@@ -1349,6 +1497,7 @@ export default function App() {
       setError("Build the graph before adding inputs.")
       return
     }
+    setRadialMenu(null)
     setSelectionMode("input")
     setPendingInputRate(ratePerS)
     setSelectedOutput(target)
@@ -1404,9 +1553,23 @@ export default function App() {
   }
 
   const openOutputModal = () => {
+    setRadialMenu(null)
     setShowOutputModal(true)
     setSelectionMode("output")
     setSelectedOutput(null)
+    setSelectedMachineId(null)
+    setOutputRecipes([])
+    setMachinesForOutput([])
+    setOutputQuery("")
+    setOutputResults([])
+    setPendingInputRate(null)
+  }
+
+  const openOutputRecipeModal = (target: Target) => {
+    setRadialMenu(null)
+    setShowOutputModal(true)
+    setSelectionMode("output")
+    setSelectedOutput(target)
     setSelectedMachineId(null)
     setOutputRecipes([])
     setMachinesForOutput([])
@@ -1495,7 +1658,10 @@ export default function App() {
             </div>
           </div>
           <div className="panel-body">
-            <div className={`graph-section ${graphTab === "graph" ? "" : "is-hidden"}`}>
+            <div
+              className={`graph-section ${graphTab === "graph" ? "" : "is-hidden"}`}
+              ref={graphSectionRef}
+            >
               <div className="graph" ref={containerRef} />
               {hoverInfo && (
                 <div
@@ -1505,6 +1671,78 @@ export default function App() {
                   {hoverInfo.lines.map(line => (
                     <div key={line}>{line}</div>
                   ))}
+                </div>
+              )}
+              {radialMenu && (
+                <div
+                  className="radial-menu-backdrop"
+                  onClick={() => setRadialMenu(null)}
+                >
+                  <div
+                    className="radial-menu"
+                    style={{ left: radialMenu.x, top: radialMenu.y }}
+                    onClick={event => event.stopPropagation()}
+                  >
+                    {radialMenu.kind === "target" && (
+                      <>
+                        <button
+                          className="radial-action radial-action-top"
+                          onClick={() => {
+                            if (radialMenu.isOutput) {
+                              openOutputRecipeModal(radialMenu.target)
+                            } else {
+                              openInputSelector(radialMenu.target, radialMenu.ratePerS)
+                            }
+                          }}
+                        >
+                          Change recipe
+                        </button>
+                        {radialMenu.isOutput && (
+                          <button
+                            className="radial-action radial-action-bottom"
+                            onClick={openOutputModal}
+                          >
+                            Change output
+                          </button>
+                        )}
+                      </>
+                    )}
+                    {radialMenu.kind === "recipe" && (
+                      <>
+                        <div className="radial-action radial-action-top radial-label">
+                          Machine tier
+                        </div>
+                        <div className="radial-action radial-action-right radial-select">
+                          <select
+                            value={getTierForRid(radialMenu.rid, radialMenu.minTier)}
+                            onChange={e => {
+                              const nextTier = e.target.value
+                              setRecipeTierOverrides(prev => ({
+                                ...prev,
+                                [radialMenu.rid]: nextTier
+                              }))
+                              setRecipeOverclockTiers(prev => ({
+                                ...prev,
+                                [radialMenu.rid]: getOverclockTiers(radialMenu.minTier, nextTier)
+                              }))
+                            }}
+                          >
+                            {getTierOptions(radialMenu.minTier, userVoltageTier).map(tier => (
+                              <option key={tier} value={tier}>
+                                {tier}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      </>
+                    )}
+                    <button
+                      className="radial-center"
+                      onClick={() => setRadialMenu(null)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
                 </div>
               )}
               {!graph && <p className="graph-empty">Select an output or load a saved configuration.</p>}
@@ -1867,6 +2105,14 @@ export default function App() {
                     </option>
                   ))}
                 </select>
+              </label>
+              <label className="checkbox">
+                <span>Flow animation</span>
+                <input
+                  type="checkbox"
+                  checked={showFlowAnimation}
+                  onChange={e => setShowFlowAnimation(e.target.checked)}
+                />
               </label>
               <button onClick={runGraph}>Build graph</button>
             </div>

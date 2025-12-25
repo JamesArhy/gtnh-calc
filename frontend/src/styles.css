@@ -334,6 +334,19 @@ label {
   color: var(--muted);
 }
 
+label.checkbox {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+label.checkbox input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
 .machines {
   display: grid;
   gap: 10px;
@@ -397,6 +410,113 @@ label {
   display: grid;
   gap: 4px;
   max-width: 220px;
+}
+
+.radial-menu-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+}
+
+.radial-menu {
+  position: absolute;
+  width: 170px;
+  height: 170px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: rgba(20, 18, 16, 0.85);
+  border: 1px solid #4a3b2e;
+  display: grid;
+  place-items: center;
+}
+
+.radial-action {
+  position: absolute;
+  background: #2f2720;
+  border: 1px solid #5a4636;
+  color: var(--text);
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.radial-action:hover,
+.radial-action:focus-visible {
+  background: #3a2f26;
+  border-color: #8a6a4a;
+  box-shadow: 0 0 0 2px rgba(138, 106, 74, 0.2);
+}
+
+.radial-label {
+  pointer-events: none;
+}
+
+.radial-select {
+  padding: 4px 8px;
+}
+
+.radial-select select {
+  background: #1c1815;
+  border: 1px solid #5a4636;
+  color: var(--text);
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-family: inherit;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.radial-select select:hover,
+.radial-select select:focus-visible {
+  border-color: #8a6a4a;
+  outline: none;
+}
+
+.radial-action-top {
+  top: -10px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.radial-action-right {
+  right: -10px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.radial-action-bottom {
+  bottom: -10px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.radial-center {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  border: 1px solid #5a4636;
+  background: #1f1914;
+  color: var(--text);
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.radial-center:hover,
+.radial-center:focus-visible {
+  background: #2a211a;
+  border-color: #8a6a4a;
+  box-shadow: 0 0 0 2px rgba(138, 106, 74, 0.2);
 }
 
 .graph {
