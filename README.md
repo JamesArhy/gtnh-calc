@@ -41,6 +41,7 @@ Environment variables (backend):
 - `DATA_SOURCE=local` (default)
 - `LOCAL_DATA_DIR=in/parquet`
 - `RECIPES_JSON=in/recipes.json`
+- `MACHINE_INDEX_JSON=in/machine_index.json`
 - `DEFAULT_VERSION=local`
 - `GRAPH_DB=ladybugdb` (default; options: `ladybugdb`, `real-ladybug`, `duckdb`/`off`)
 

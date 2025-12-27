@@ -10,9 +10,10 @@ from pydantic import BaseModel
 
 from .config import load_settings
 from .data_source import LocalDataSource, S3DataSource
-from .gtnh import MachineTuning
+from .gtnh import MachineTuning, apply_machine_bonuses
 from .graph import GraphRequest, GraphTarget, build_graph
 from .graph_store import create_graph_store
+from .machine_index import load_machine_bonuses
 from .name_index import load_name_index
 
 settings = load_settings()
@@ -24,7 +25,8 @@ elif settings.data_source == "s3":
 else:
     raise RuntimeError(f"Unsupported data source: {settings.data_source}")
 
-name_index = load_name_index(settings.recipes_json)
+name_index = load_name_index(settings.recipes_json, settings.machine_index_json)
+machine_bonuses = load_machine_bonuses(settings.machine_index_json, settings.local_data_dir)
 graph_store = None
 if settings.data_source == "local":
     graph_store = create_graph_store(settings.graph_backend, settings.local_data_dir)
@@ -77,6 +79,20 @@ class GraphRequestModel(BaseModel):
     recipe_overclock_tiers: dict[str, int] = {}
 
 
+def apply_recipe_bonuses(recipe: dict) -> dict:
+    bonus = machine_bonuses.get(recipe.get("machine_id"))
+    if not bonus:
+        return recipe
+    duration_ticks, eut = apply_machine_bonuses(recipe["duration_ticks"], recipe["eut"], bonus)
+    return {
+        **recipe,
+        "base_duration_ticks": recipe["duration_ticks"],
+        "base_eut": recipe["eut"],
+        "duration_ticks": duration_ticks,
+        "eut": eut,
+    }
+
+
 @app.get("/api/versions")
 def list_versions():
     return {"versions": list(data_source.list_versions())}
@@ -92,15 +108,44 @@ def search_items(q: str, limit: int = 20, version: str | None = None):
         results = dataset.list_item_matches(q, limit)
         dataset.close()
 
-    if q and len(results) < limit:
+    if q:
         q_lower = q.lower()
-        seen = {(item["item_id"], int(item["meta"])) for item in results}
-        for (item_id, meta), name in name_index.items.items():
-            if q_lower in name.lower() and (item_id, meta) not in seen:
-                results.append({"item_id": item_id, "meta": int(meta)})
-                seen.add((item_id, meta))
-                if len(results) >= limit:
-                    break
+        name_matches = [
+            (item_id, meta, name)
+            for (item_id, meta), name in name_index.items.items()
+            if q_lower in name.lower()
+        ]
+        exact_matches = [
+            (item_id, meta)
+            for item_id, meta, name in name_matches
+            if name.lower() == q_lower
+        ]
+        partial_matches = [
+            (item_id, meta)
+            for item_id, meta, name in name_matches
+            if name.lower() != q_lower
+        ]
+        seen = set()
+        ordered_results: list[dict] = []
+        for item_id, meta in exact_matches:
+            if (item_id, meta) in seen:
+                continue
+            seen.add((item_id, meta))
+            ordered_results.append({"item_id": item_id, "meta": int(meta)})
+        for item in results:
+            key = (item["item_id"], int(item["meta"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered_results.append(item)
+        for item_id, meta in partial_matches:
+            if (item_id, meta) in seen:
+                continue
+            seen.add((item_id, meta))
+            ordered_results.append({"item_id": item_id, "meta": int(meta)})
+            if len(ordered_results) >= limit:
+                break
+        results = ordered_results[:limit]
 
     enriched = []
     for item in results:
@@ -180,6 +225,7 @@ def recipes_by_output(
 
         enriched = []
         for recipe in recipes:
+            recipe = apply_recipe_bonuses(recipe)
             info = name_index.recipes.get(recipe["rid"], {})
             inputs = dataset.recipe_inputs(recipe["rid"])
             outputs = dataset.recipe_outputs(recipe["rid"])
@@ -187,6 +233,7 @@ def recipes_by_output(
                 {
                     **recipe,
                     "machine_name": info.get("machine_name") or recipe.get("machine_id"),
+                    "machine_names_by_tier": name_index.machine_names_by_tier.get(recipe.get("machine_id"), {}),
                     "min_tier": info.get("min_tier"),
                     "min_voltage": info.get("min_voltage"),
                     "amps": info.get("amps"),
@@ -264,6 +311,7 @@ def machines_by_output(
             {
                 "machine_id": machine_id,
                 "machine_name": name_index.machine_names.get(machine_id, machine_id),
+                "machine_names_by_tier": name_index.machine_names_by_tier.get(machine_id, {}),
                 "recipe_count": int(recipe_count) if recipe_count is not None else None,
             }
         )
@@ -281,6 +329,7 @@ def list_machines(version: str | None = None):
             {
                 "machine_id": machine_id,
                 "machine_name": name_index.machine_names.get(machine_id, machine_id),
+                "machine_names_by_tier": name_index.machine_names_by_tier.get(machine_id, {}),
             }
         )
     return {"machines": machines}
@@ -298,6 +347,7 @@ def recipes_by_machine(
     results = []
     raw_recipes = dataset.recipes_for_machine(machine_id, limit if not q else limit * 5)
     for recipe in raw_recipes:
+        recipe = apply_recipe_bonuses(recipe)
         info = name_index.recipes.get(recipe["rid"], {})
         inputs = dataset.recipe_inputs(recipe["rid"])
         outputs = dataset.recipe_outputs(recipe["rid"])
@@ -330,6 +380,7 @@ def recipes_by_machine(
             {
                 **recipe,
                 "machine_name": info.get("machine_name") or recipe.get("machine_id"),
+                "machine_names_by_tier": name_index.machine_names_by_tier.get(recipe.get("machine_id"), {}),
                 "min_tier": info.get("min_tier"),
                 "min_voltage": info.get("min_voltage"),
                 "amps": info.get("amps"),
@@ -392,7 +443,7 @@ def graph(req: GraphRequestModel):
         recipe_override=req.recipe_override,
         recipe_overclock_tiers=req.recipe_overclock_tiers,
     )
-    result = build_graph(dataset, name_index, graph_req)
+    result = build_graph(dataset, name_index, graph_req, machine_bonuses)
     dataset.close()
     return result
 

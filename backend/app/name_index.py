@@ -13,6 +13,24 @@ class NameIndex:
     fluids: Dict[str, str]
     recipes: Dict[str, Dict[str, Any]]
     machine_names: Dict[str, str]
+    machine_names_by_tier: Dict[str, Dict[str, str]]
+
+
+_TIER_ORDER = [
+    "ULV",
+    "LV",
+    "MV",
+    "HV",
+    "EV",
+    "IV",
+    "LuV",
+    "ZPM",
+    "UV",
+    "UHV",
+    "UEV",
+    "UIV",
+    "UMV",
+]
 
 
 def _title_from_recipe_map(name: str) -> str:
@@ -26,14 +44,62 @@ def _title_from_recipe_map(name: str) -> str:
     return titled
 
 
-def load_name_index(recipes_json: Path) -> NameIndex:
+def _parse_machine_tier(meta_tile_name: str | None) -> str | None:
+    if not meta_tile_name:
+        return None
+    match = re.search(r"tier\.(\d+)", meta_tile_name)
+    if not match:
+        return None
+    tier_num = int(match.group(1))
+    if tier_num < 0:
+        return None
+    if tier_num == 0:
+        return "ULV"
+    if tier_num < len(_TIER_ORDER):
+        return _TIER_ORDER[tier_num]
+    return None
+
+
+def _load_machine_names(machine_index_json: Path) -> tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
+    if not machine_index_json.exists():
+        return {}, {}
+    with machine_index_json.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    names: Dict[str, str] = {}
+    names_by_tier: Dict[str, Dict[str, str]] = {}
+    for entry in data.get("machineIndex", []):
+        machine_id = entry.get("machineId")
+        display_name = entry.get("displayName")
+        if not machine_id or not display_name:
+            continue
+        if machine_id not in names:
+            names[machine_id] = display_name
+        tier = _parse_machine_tier(entry.get("metaTileName"))
+        if tier:
+            names_by_tier.setdefault(machine_id, {})[tier] = display_name
+    return names, names_by_tier
+
+
+def load_name_index(recipes_json: Path, machine_index_json: Path | None = None) -> NameIndex:
     items: Dict[ItemKey, str] = {}
     fluids: Dict[str, str] = {}
     recipes: Dict[str, Dict[str, Any]] = {}
     machine_names: Dict[str, str] = {}
+    machine_names_by_tier: Dict[str, Dict[str, str]] = {}
+
+    if machine_index_json is not None:
+        names, names_by_tier = _load_machine_names(machine_index_json)
+        machine_names.update(names)
+        machine_names_by_tier.update(names_by_tier)
 
     if not recipes_json.exists():
-        return NameIndex(items=items, fluids=fluids, recipes=recipes, machine_names=machine_names)
+        return NameIndex(
+            items=items,
+            fluids=fluids,
+            recipes=recipes,
+            machine_names=machine_names,
+            machine_names_by_tier=machine_names_by_tier,
+        )
 
     # NOTE: this loads the full JSON; keep it simple for now.
     with recipes_json.open("r", encoding="utf-8") as f:
@@ -43,7 +109,7 @@ def load_name_index(recipes_json: Path) -> NameIndex:
         display_name = recipe_map.get("displayName") or ""
         machine_id = recipe_map.get("machineId")
         pretty_name = _title_from_recipe_map(display_name) if display_name else None
-        if machine_id and pretty_name:
+        if machine_id and pretty_name and machine_id not in machine_names:
             machine_names.setdefault(machine_id, pretty_name)
         for recipe in recipe_map.get("recipes", []):
             rid = recipe.get("rid")
@@ -73,4 +139,5 @@ def load_name_index(recipes_json: Path) -> NameIndex:
         fluids=fluids,
         recipes=recipes,
         machine_names=machine_names,
+        machine_names_by_tier=machine_names_by_tier,
     )

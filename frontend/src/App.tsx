@@ -79,6 +79,8 @@ type RecipeOption = {
   rid: string
   machine_id: string
   machine_name?: string
+  base_duration_ticks?: number
+  base_eut?: number
   duration_ticks: number
   eut: number
   min_tier?: string
@@ -1624,9 +1626,7 @@ export default function App() {
     <div className="app">
       <header className="hero">
         <div>
-          <p className="eyebrow">GT New Horizons Planner</p>
-          <h1>Production Graph Builder</h1>
-          <p className="subtitle">Calculate machine counts per recipe chain and visualize GTNH throughput.</p>
+          <h1 className="hero-title">GT: New Horizons Production Line Planner</h1>
         </div>
       </header>
 

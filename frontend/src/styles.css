@@ -37,6 +37,10 @@ body {
   margin: 4px 0 12px;
 }
 
+.hero-title {
+  color: var(--accent);
+}
+
 .eyebrow {
   text-transform: uppercase;
   letter-spacing: 0.2em;
@@ -538,7 +542,7 @@ label.checkbox input {
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
   gap: 18px;
-  align-items: start;
+  align-items: stretch;
 }
 
 .viz-footer {

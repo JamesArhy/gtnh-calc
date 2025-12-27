@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Dict
 
 from .data_source import DuckDBDataset
-from .gtnh import MachineTuning, apply_overclock, rate_per_second
+from .gtnh import MachineBonus, MachineTuning, apply_tuning, effective_parallel, rate_per_second
 from .name_index import NameIndex
 
 
@@ -39,7 +39,12 @@ def _recipe_key(rid: str, output_key: str) -> str:
     return f"recipe:{rid}:{output_key}"
 
 
-def build_graph(dataset: DuckDBDataset, names: NameIndex, req: GraphRequest) -> dict:
+def build_graph(
+    dataset: DuckDBDataset,
+    names: NameIndex,
+    req: GraphRequest,
+    machine_bonuses: Dict[str, MachineBonus] | None = None,
+) -> dict:
     nodes: Dict[str, dict] = {}
     edges: Dict[str, dict] = {}
 
@@ -48,6 +53,17 @@ def build_graph(dataset: DuckDBDataset, names: NameIndex, req: GraphRequest) -> 
         if override is None:
             return req.tuning
         return MachineTuning(overclock_tiers=int(override), parallel=req.tuning.parallel)
+
+    def bonus_for_recipe(recipe: dict) -> MachineBonus | None:
+        if not machine_bonuses:
+            return None
+        return machine_bonuses.get(recipe.get("machine_id"))
+
+    def apply_recipe_tuning(recipe: dict, tuning: MachineTuning) -> tuple[int, int, float]:
+        bonus = bonus_for_recipe(recipe)
+        duration_ticks, eut = apply_tuning(recipe["duration_ticks"], recipe["eut"], tuning, bonus)
+        parallel = effective_parallel(tuning, bonus)
+        return duration_ticks, eut, parallel
 
     def ensure_item_node(item_id: str, meta: int) -> str:
         node_id = _item_key(item_id, meta)
@@ -79,7 +95,7 @@ def build_graph(dataset: DuckDBDataset, names: NameIndex, req: GraphRequest) -> 
     ) -> str:
         node_id = _recipe_key(recipe["rid"], output_key)
         if node_id not in nodes:
-            duration_ticks, eut = apply_overclock(recipe["duration_ticks"], recipe["eut"], tuning)
+            duration_ticks, eut, parallel = apply_recipe_tuning(recipe, tuning)
             recipe_info = names.recipes.get(recipe["rid"], {})
             machine_name = recipe_info.get("machine_name") or recipe["machine_id"]
             nodes[node_id] = {
@@ -95,7 +111,7 @@ def build_graph(dataset: DuckDBDataset, names: NameIndex, req: GraphRequest) -> 
                 "duration_ticks": duration_ticks,
                 "eut": eut,
                 "overclock_tiers": tuning.overclock_tiers,
-                "parallel": tuning.parallel,
+                "parallel": parallel,
                 "machines_required": None,
                 "target_rate_per_s": target_rate,
                 "target_output": target_output,
@@ -138,7 +154,7 @@ def build_graph(dataset: DuckDBDataset, names: NameIndex, req: GraphRequest) -> 
 
         tuning = tuning_for_recipe(recipe)
         outputs = dataset.recipe_outputs(recipe["rid"])
-        duration_ticks, _ = apply_overclock(recipe["duration_ticks"], recipe["eut"], tuning)
+        duration_ticks, _, parallel = apply_recipe_tuning(recipe, tuning)
 
         target_output = None
         for out in outputs["items"]:
@@ -149,7 +165,7 @@ def build_graph(dataset: DuckDBDataset, names: NameIndex, req: GraphRequest) -> 
             return
 
         per_machine_rate = rate_per_second(target_output["count"], duration_ticks)
-        total_rate_per_machine = per_machine_rate * max(1, tuning.parallel)
+        total_rate_per_machine = per_machine_rate * max(1, parallel)
         machines_required = rate_needed / total_rate_per_machine if total_rate_per_machine > 0 else 0
 
         output_key = f"item:{item_id}:{meta}"
@@ -245,7 +261,7 @@ def build_graph(dataset: DuckDBDataset, names: NameIndex, req: GraphRequest) -> 
 
         tuning = tuning_for_recipe(recipe)
         outputs = dataset.recipe_outputs(recipe["rid"])
-        duration_ticks, _ = apply_overclock(recipe["duration_ticks"], recipe["eut"], tuning)
+        duration_ticks, _, parallel = apply_recipe_tuning(recipe, tuning)
 
         target_output = None
         for out in outputs["fluids"]:
@@ -256,7 +272,7 @@ def build_graph(dataset: DuckDBDataset, names: NameIndex, req: GraphRequest) -> 
             return
 
         per_machine_rate = rate_per_second(target_output["mb"], duration_ticks)
-        total_rate_per_machine = per_machine_rate * max(1, tuning.parallel)
+        total_rate_per_machine = per_machine_rate * max(1, parallel)
         machines_required = rate_needed / total_rate_per_machine if total_rate_per_machine > 0 else 0
 
         output_key = f"fluid:{fluid_id}"
