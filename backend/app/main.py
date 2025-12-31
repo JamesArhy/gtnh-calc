@@ -1,22 +1,25 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .config import load_settings
 from .data_source import LocalDataSource, S3DataSource
 from .gtnh import MachineTuning, apply_machine_bonuses
-from .graph import GraphRequest, GraphTarget, build_graph
+from .graph import GraphByproductTarget, GraphRequest, GraphTarget, build_graph
 from .graph_store import create_graph_store
 from .machine_index import load_machine_bonuses
 from .name_index import load_name_index
 
 settings = load_settings()
+logger = logging.getLogger("gtnh-api")
 
 if settings.data_source == "local":
     data_source = LocalDataSource(settings.local_data_dir, settings.default_version)
@@ -45,7 +48,11 @@ app.add_middleware(
 
 @app.middleware("http")
 async def log_and_cors(request: Request, call_next):
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        response = JSONResponse({"detail": "Internal server error"}, status_code=500)
     origin = request.headers.get("origin")
     if origin:
         response.headers.setdefault("Access-Control-Allow-Origin", origin)
@@ -62,7 +69,18 @@ class GraphTargetModel(BaseModel):
     target_type: str
     target_id: str
     target_meta: int = 0
-    target_rate_per_s: float
+    target_rate_per_s: float = 0.0
+    target_machine_count: int | None = None
+
+
+class GraphByproductTargetModel(BaseModel):
+    input_type: str
+    input_id: str
+    input_meta: int = 0
+    output_type: str
+    output_id: str
+    output_meta: int = 0
+    recipe_rid: str
 
 
 class GraphRequestModel(BaseModel):
@@ -72,11 +90,14 @@ class GraphRequestModel(BaseModel):
     target_id: str = ""
     target_meta: int = 0
     target_rate_per_s: float = 0.0
+    target_machine_count: int | None = None
     max_depth: int = 3
     overclock_tiers: int = 0
     parallel: int = 1
     recipe_override: dict[str, str] = {}
     recipe_overclock_tiers: dict[str, int] = {}
+    machine_count_overrides: dict[str, int] = {}
+    byproduct_targets: list[GraphByproductTargetModel] = []
 
 
 def apply_recipe_bonuses(recipe: dict) -> dict:
@@ -107,6 +128,16 @@ def search_items(q: str, limit: int = 20, version: str | None = None):
         dataset = data_source.open_dataset(version or settings.default_version)
         results = dataset.list_item_matches(q, limit)
         dataset.close()
+
+    normalized_results = []
+    for item in results:
+        meta_value = item.get("meta", 0)
+        try:
+            meta_value = int(meta_value)
+        except (TypeError, ValueError):
+            meta_value = 0
+        normalized_results.append({**item, "meta": meta_value})
+    results = normalized_results
 
     if q:
         q_lower = q.lower()
@@ -149,7 +180,7 @@ def search_items(q: str, limit: int = 20, version: str | None = None):
 
     enriched = []
     for item in results:
-        name = name_index.items.get((item["item_id"], item["meta"]))
+        name = name_index.items.get((item["item_id"], int(item.get("meta", 0))))
         enriched.append({**item, "name": name})
     return {"items": enriched}
 
@@ -274,6 +305,170 @@ def recipes_by_output(
             dataset.close()
 
 
+@app.get("/api/recipes/by-input")
+def recipes_by_input(
+    input_type: str,
+    item_id: str | None = None,
+    meta: int = 0,
+    fluid_id: str | None = None,
+    machine_id: str | None = None,
+    limit: int = 10,
+    downstream_type: str | None = None,
+    downstream_item_id: str | None = None,
+    downstream_meta: int = 0,
+    downstream_fluid_id: str | None = None,
+    max_depth: int = 5,
+    version: str | None = None,
+):
+    dataset = None
+    try:
+        recipes = None
+        if input_type == "item" and item_id:
+            if downstream_type:
+                if not graph_store:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Downstream filtering requires GRAPH_DB=ladybugdb.",
+                    )
+                graph_store.wait_until_ready()
+                if downstream_type == "item" and downstream_item_id:
+                    recipes = graph_store.recipes_by_input_item_downstream(
+                        item_id,
+                        meta,
+                        downstream_type,
+                        downstream_item_id,
+                        downstream_meta,
+                        max_depth,
+                        limit,
+                        machine_id,
+                    )
+                elif downstream_type == "fluid" and downstream_fluid_id:
+                    recipes = graph_store.recipes_by_input_item_downstream(
+                        item_id,
+                        meta,
+                        downstream_type,
+                        downstream_fluid_id,
+                        downstream_meta,
+                        max_depth,
+                        limit,
+                        machine_id,
+                    )
+                else:
+                    raise HTTPException(status_code=400, detail="Invalid downstream selector")
+            else:
+                if graph_store:
+                    graph_store.wait_until_ready()
+                    recipes = graph_store.recipes_by_input_item(item_id, meta, limit, machine_id)
+                else:
+                    dataset = data_source.open_dataset(version or settings.default_version)
+                    if machine_id:
+                        recipes = dataset.recipes_for_input_item_by_machine(
+                            item_id, meta, machine_id, limit
+                        )
+                    else:
+                        recipes = dataset.recipes_for_input_item(item_id, meta, limit)
+        elif input_type == "fluid" and fluid_id:
+            if downstream_type:
+                if not graph_store:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Downstream filtering requires GRAPH_DB=ladybugdb.",
+                    )
+                graph_store.wait_until_ready()
+                if downstream_type == "item" and downstream_item_id:
+                    recipes = graph_store.recipes_by_input_fluid_downstream(
+                        fluid_id,
+                        downstream_type,
+                        downstream_item_id,
+                        downstream_meta,
+                        max_depth,
+                        limit,
+                        machine_id,
+                    )
+                elif downstream_type == "fluid" and downstream_fluid_id:
+                    recipes = graph_store.recipes_by_input_fluid_downstream(
+                        fluid_id,
+                        downstream_type,
+                        downstream_fluid_id,
+                        downstream_meta,
+                        max_depth,
+                        limit,
+                        machine_id,
+                    )
+                else:
+                    raise HTTPException(status_code=400, detail="Invalid downstream selector")
+            else:
+                if graph_store:
+                    graph_store.wait_until_ready()
+                    recipes = graph_store.recipes_by_input_fluid(fluid_id, limit, machine_id)
+                else:
+                    dataset = data_source.open_dataset(version or settings.default_version)
+                    if machine_id:
+                        recipes = dataset.recipes_for_input_fluid_by_machine(
+                            fluid_id, machine_id, limit
+                        )
+                    else:
+                        recipes = dataset.recipes_for_input_fluid(fluid_id, limit)
+        else:
+            raise HTTPException(status_code=400, detail="Invalid input selector")
+
+        if recipes is None:
+            raise HTTPException(status_code=400, detail="Invalid input selector")
+
+        if dataset is None:
+            dataset = data_source.open_dataset(version or settings.default_version)
+
+        enriched = []
+        for recipe in recipes:
+            recipe = apply_recipe_bonuses(recipe)
+            info = name_index.recipes.get(recipe["rid"], {})
+            inputs = dataset.recipe_inputs(recipe["rid"])
+            outputs = dataset.recipe_outputs(recipe["rid"])
+            enriched.append(
+                {
+                    **recipe,
+                    "machine_name": info.get("machine_name") or recipe.get("machine_id"),
+                    "machine_names_by_tier": name_index.machine_names_by_tier.get(recipe.get("machine_id"), {}),
+                    "min_tier": info.get("min_tier"),
+                    "min_voltage": info.get("min_voltage"),
+                    "amps": info.get("amps"),
+                    "ebf_temp": info.get("ebf_temp"),
+                    "item_inputs": [
+                        {
+                            **item,
+                            "name": name_index.items.get((item["item_id"], item["meta"])),
+                        }
+                        for item in inputs["items"]
+                    ],
+                    "fluid_inputs": [
+                        {
+                            **fluid,
+                            "name": name_index.fluids.get(fluid["fluid_id"]),
+                        }
+                        for fluid in inputs["fluids"]
+                    ],
+                    "item_outputs": [
+                        {
+                            **item,
+                            "name": name_index.items.get((item["item_id"], item["meta"])),
+                        }
+                        for item in outputs["items"]
+                    ],
+                    "fluid_outputs": [
+                        {
+                            **fluid,
+                            "name": name_index.fluids.get(fluid["fluid_id"]),
+                        }
+                        for fluid in outputs["fluids"]
+                    ],
+                }
+            )
+        return {"recipes": enriched}
+    finally:
+        if dataset is not None:
+            dataset.close()
+
+
 @app.get("/api/machines/by-output")
 def machines_by_output(
     output_type: str,
@@ -302,6 +497,50 @@ def machines_by_output(
             dataset.close()
     else:
         raise HTTPException(status_code=400, detail="Invalid output selector")
+
+    machines = []
+    for row in machine_rows or []:
+        machine_id = row.get("machine_id")
+        recipe_count = row.get("recipe_count")
+        machines.append(
+            {
+                "machine_id": machine_id,
+                "machine_name": name_index.machine_names.get(machine_id, machine_id),
+                "machine_names_by_tier": name_index.machine_names_by_tier.get(machine_id, {}),
+                "recipe_count": int(recipe_count) if recipe_count is not None else None,
+            }
+        )
+    return {"machines": machines}
+
+
+@app.get("/api/machines/by-input")
+def machines_by_input(
+    input_type: str,
+    item_id: str | None = None,
+    meta: int = 0,
+    fluid_id: str | None = None,
+    limit: int = 200,
+    version: str | None = None,
+):
+    machine_rows = None
+    if input_type == "item" and item_id:
+        if graph_store:
+            graph_store.wait_until_ready()
+            machine_rows = graph_store.machine_counts_by_input_item(item_id, meta, limit)
+        else:
+            dataset = data_source.open_dataset(version or settings.default_version)
+            machine_rows = dataset.machine_recipe_counts_for_input_item(item_id, meta, limit)
+            dataset.close()
+    elif input_type == "fluid" and fluid_id:
+        if graph_store:
+            graph_store.wait_until_ready()
+            machine_rows = graph_store.machine_counts_by_input_fluid(fluid_id, limit)
+        else:
+            dataset = data_source.open_dataset(version or settings.default_version)
+            machine_rows = dataset.machine_recipe_counts_for_input_fluid(fluid_id, limit)
+            dataset.close()
+    else:
+        raise HTTPException(status_code=400, detail="Invalid input selector")
 
     machines = []
     for row in machine_rows or []:
@@ -420,6 +659,7 @@ def graph(req: GraphRequestModel):
                 target_id=target.target_id,
                 target_meta=target.target_meta,
                 target_rate_per_s=target.target_rate_per_s,
+                target_machine_count=target.target_machine_count,
             )
             for target in req.targets
         ]
@@ -433,8 +673,21 @@ def graph(req: GraphRequestModel):
                 target_id=req.target_id,
                 target_meta=req.target_meta,
                 target_rate_per_s=req.target_rate_per_s,
+                target_machine_count=req.target_machine_count,
             )
         ]
+    byproduct_targets = [
+        GraphByproductTarget(
+            input_type=target.input_type,
+            input_id=target.input_id,
+            input_meta=target.input_meta,
+            output_type=target.output_type,
+            output_id=target.output_id,
+            output_meta=target.output_meta,
+            recipe_rid=target.recipe_rid,
+        )
+        for target in (req.byproduct_targets or [])
+    ]
     graph_req = GraphRequest(
         version=req.version or settings.default_version,
         targets=targets,
@@ -442,6 +695,8 @@ def graph(req: GraphRequestModel):
         tuning=tuning,
         recipe_override=req.recipe_override,
         recipe_overclock_tiers=req.recipe_overclock_tiers,
+        machine_count_overrides=req.machine_count_overrides,
+        byproduct_targets=byproduct_targets,
     )
     result = build_graph(dataset, name_index, graph_req, machine_bonuses)
     dataset.close()

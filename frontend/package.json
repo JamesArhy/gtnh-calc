@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "cytoscape": "3.29.2",
-    "cytoscape-svg": "0.4.0",
+    "cytoscape-dagre": "2.5.0",
+    "cytoscape-svg": "npm:@tone-row/cytoscape-svg@latest",
     "jspdf": "3.0.4",
     "react": "18.3.1",
     "react-dom": "18.3.1",

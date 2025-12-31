@@ -15,6 +15,7 @@ class GraphTarget:
     target_id: str
     target_meta: int
     target_rate_per_s: float
+    target_machine_count: int | None = None
 
 
 @dataclass
@@ -25,6 +26,19 @@ class GraphRequest:
     tuning: MachineTuning
     recipe_override: Dict[str, str]
     recipe_overclock_tiers: Dict[str, int]
+    machine_count_overrides: Dict[str, int]
+    byproduct_targets: list["GraphByproductTarget"]
+
+
+@dataclass
+class GraphByproductTarget:
+    input_type: str
+    input_id: str
+    input_meta: int
+    output_type: str
+    output_id: str
+    output_meta: int
+    recipe_rid: str
 
 
 def _item_key(item_id: str, meta: int) -> str:
@@ -39,6 +53,21 @@ def _recipe_key(rid: str, output_key: str) -> str:
     return f"recipe:{rid}:{output_key}"
 
 
+def _output_chance_multiplier(output: dict) -> float:
+    chance = output.get("chance")
+    if chance is None:
+        return 1.0
+    try:
+        value = float(chance)
+    except (TypeError, ValueError):
+        return 1.0
+    if value <= 0:
+        return 0.0
+    if value > 1.0 and value <= 100.0:
+        return value / 100.0
+    return value
+
+
 def build_graph(
     dataset: DuckDBDataset,
     names: NameIndex,
@@ -47,6 +76,7 @@ def build_graph(
 ) -> dict:
     nodes: Dict[str, dict] = {}
     edges: Dict[str, dict] = {}
+    target_rates: Dict[str, float] = {}
 
     def tuning_for_recipe(recipe: dict) -> MachineTuning:
         override = req.recipe_overclock_tiers.get(recipe["rid"])
@@ -106,6 +136,7 @@ def build_graph(
                 "machine_id": recipe["machine_id"],
                 "machine_name": machine_name,
                 "min_tier": recipe_info.get("min_tier"),
+                "output_key": output_key,
                 "base_duration_ticks": recipe["duration_ticks"],
                 "base_eut": recipe["eut"],
                 "duration_ticks": duration_ticks,
@@ -113,10 +144,19 @@ def build_graph(
                 "overclock_tiers": tuning.overclock_tiers,
                 "parallel": parallel,
                 "machines_required": None,
+                "machines_demand": None,
                 "target_rate_per_s": target_rate,
                 "target_output": target_output,
             }
         return node_id
+
+    def resolve_machine_count(output_key: str, machine_count: int | None) -> int | None:
+        if machine_count is not None:
+            return max(0, int(machine_count))
+        override = req.machine_count_overrides.get(output_key)
+        if override is None:
+            return None
+        return max(0, int(override))
 
     def add_edge(source: str, target: str, data: dict) -> None:
         edge_id = f"{source}->{target}:{data.get('kind', 'link')}"
@@ -130,7 +170,14 @@ def build_graph(
             **data,
         }
 
-    def expand_item(item_id: str, meta: int, rate_needed: float, depth: int, path: set[str]) -> None:
+    def expand_item(
+        item_id: str,
+        meta: int,
+        rate_needed: float,
+        machine_count: int | None,
+        depth: int,
+        path: set[str],
+    ) -> None:
         if depth > req.max_depth:
             return
         path_key = f"item:{item_id}:{meta}"
@@ -164,13 +211,22 @@ def build_graph(
         if not target_output:
             return
 
-        per_machine_rate = rate_per_second(target_output["count"], duration_ticks)
+        chance_multiplier = _output_chance_multiplier(target_output)
+        per_machine_rate = rate_per_second(target_output["count"] * chance_multiplier, duration_ticks)
         total_rate_per_machine = per_machine_rate * max(1, parallel)
-        machines_required = rate_needed / total_rate_per_machine if total_rate_per_machine > 0 else 0
-
         output_key = f"item:{item_id}:{meta}"
+        machines_demand = rate_needed / total_rate_per_machine if total_rate_per_machine > 0 else 0
+        configured_machines = resolve_machine_count(output_key, machine_count)
+        if configured_machines is not None:
+            machines_required = float(configured_machines)
+            rate_needed = total_rate_per_machine * machines_required
+        else:
+            machines_required = machines_demand
+
+        target_rates[output_key] = rate_needed
         recipe_node = ensure_recipe_node(recipe, tuning, rate_needed, target_output, output_key)
         nodes[recipe_node]["machines_required"] = machines_required
+        nodes[recipe_node]["machines_demand"] = machines_demand
         nodes[recipe_node]["per_machine_rate_per_s"] = per_machine_rate
 
         add_edge(
@@ -180,6 +236,7 @@ def build_graph(
                 "kind": "produces",
                 "rate_per_s": rate_needed,
                 "count_per_cycle": target_output["count"],
+                "chance": target_output.get("chance"),
             },
         )
 
@@ -196,7 +253,7 @@ def build_graph(
                     "count_per_cycle": inp["count"],
                 },
             )
-            expand_item(inp["item_id"], inp["meta"], req_rate, depth + 1, next_path)
+            expand_item(inp["item_id"], inp["meta"], req_rate, None, depth + 1, next_path)
 
         for inp in inputs["fluids"]:
             inp_node = ensure_fluid_node(inp["fluid_id"])
@@ -215,29 +272,41 @@ def build_graph(
             if out["item_id"] == item_id and out["meta"] == meta:
                 continue
             out_node = ensure_item_node(out["item_id"], out["meta"])
+            chance_multiplier = _output_chance_multiplier(out)
             add_edge(
                 recipe_node,
                 out_node,
                 {
                     "kind": "byproduct",
-                    "rate_per_s": rate_per_second(out["count"], duration_ticks) * machines_required,
+                    "rate_per_s": rate_per_second(out["count"] * chance_multiplier, duration_ticks)
+                    * machines_required,
                     "count_per_cycle": out["count"],
+                    "chance": out.get("chance"),
                 },
             )
 
         for out in outputs["fluids"]:
             out_node = ensure_fluid_node(out["fluid_id"])
+            chance_multiplier = _output_chance_multiplier(out)
             add_edge(
                 recipe_node,
                 out_node,
                 {
                     "kind": "byproduct",
-                    "rate_per_s": rate_per_second(out["mb"], duration_ticks) * machines_required,
+                    "rate_per_s": rate_per_second(out["mb"] * chance_multiplier, duration_ticks)
+                    * machines_required,
                     "mb_per_cycle": out["mb"],
+                    "chance": out.get("chance"),
                 },
             )
 
-    def expand_fluid(fluid_id: str, rate_needed: float, depth: int, path: set[str]) -> None:
+    def expand_fluid(
+        fluid_id: str,
+        rate_needed: float,
+        machine_count: int | None,
+        depth: int,
+        path: set[str],
+    ) -> None:
         if depth > req.max_depth:
             return
         path_key = f"fluid:{fluid_id}"
@@ -271,13 +340,22 @@ def build_graph(
         if not target_output:
             return
 
-        per_machine_rate = rate_per_second(target_output["mb"], duration_ticks)
+        chance_multiplier = _output_chance_multiplier(target_output)
+        per_machine_rate = rate_per_second(target_output["mb"] * chance_multiplier, duration_ticks)
         total_rate_per_machine = per_machine_rate * max(1, parallel)
-        machines_required = rate_needed / total_rate_per_machine if total_rate_per_machine > 0 else 0
-
         output_key = f"fluid:{fluid_id}"
+        machines_demand = rate_needed / total_rate_per_machine if total_rate_per_machine > 0 else 0
+        configured_machines = resolve_machine_count(output_key, machine_count)
+        if configured_machines is not None:
+            machines_required = float(configured_machines)
+            rate_needed = total_rate_per_machine * machines_required
+        else:
+            machines_required = machines_demand
+
+        target_rates[output_key] = rate_needed
         recipe_node = ensure_recipe_node(recipe, tuning, rate_needed, target_output, output_key)
         nodes[recipe_node]["machines_required"] = machines_required
+        nodes[recipe_node]["machines_demand"] = machines_demand
         nodes[recipe_node]["per_machine_rate_per_s"] = per_machine_rate
 
         add_edge(
@@ -287,6 +365,7 @@ def build_graph(
                 "kind": "produces",
                 "rate_per_s": rate_needed,
                 "mb_per_cycle": target_output["mb"],
+                "chance": target_output.get("chance"),
             },
         )
 
@@ -303,7 +382,7 @@ def build_graph(
                     "count_per_cycle": inp["count"],
                 },
             )
-            expand_item(inp["item_id"], inp["meta"], req_rate, depth + 1, next_path)
+            expand_item(inp["item_id"], inp["meta"], req_rate, None, depth + 1, next_path)
 
         for inp in inputs["fluids"]:
             inp_node = ensure_fluid_node(inp["fluid_id"])
@@ -318,13 +397,267 @@ def build_graph(
                 },
             )
             if inp["fluid_id"] != fluid_id:
-                expand_fluid(inp["fluid_id"], req_rate, depth + 1, next_path)
+                expand_fluid(inp["fluid_id"], req_rate, None, depth + 1, next_path)
+
+        for out in outputs["items"]:
+            out_node = ensure_item_node(out["item_id"], out["meta"])
+            chance_multiplier = _output_chance_multiplier(out)
+            add_edge(
+                recipe_node,
+                out_node,
+                {
+                    "kind": "byproduct",
+                    "rate_per_s": rate_per_second(out["count"] * chance_multiplier, duration_ticks)
+                    * machines_required,
+                    "count_per_cycle": out["count"],
+                    "chance": out.get("chance"),
+                },
+            )
+
+        for out in outputs["fluids"]:
+            if out["fluid_id"] == fluid_id:
+                continue
+            out_node = ensure_fluid_node(out["fluid_id"])
+            chance_multiplier = _output_chance_multiplier(out)
+            add_edge(
+                recipe_node,
+                out_node,
+                {
+                    "kind": "byproduct",
+                    "rate_per_s": rate_per_second(out["mb"] * chance_multiplier, duration_ticks)
+                    * machines_required,
+                    "mb_per_cycle": out["mb"],
+                    "chance": out.get("chance"),
+                },
+            )
+
+    def get_byproduct_supply(node_id: str) -> float:
+        total = 0.0
+        for edge in edges.values():
+            if edge.get("target") != node_id:
+                continue
+            kind = edge.get("kind")
+            if kind == "byproduct":
+                total += edge.get("rate_per_s", 0)
+                continue
+            if kind == "produces":
+                source_id = edge.get("source")
+                if source_id and nodes.get(source_id, {}).get("byproduct_input_key"):
+                    total += edge.get("rate_per_s", 0)
+        return total
+
+    def expand_byproduct_target(target: GraphByproductTarget) -> bool:
+        if not target.recipe_rid:
+            return False
+        if target.input_type == "item":
+            input_key = _item_key(target.input_id, target.input_meta)
+            input_node = ensure_item_node(target.input_id, target.input_meta)
+        else:
+            input_key = _fluid_key(target.input_id)
+            input_node = ensure_fluid_node(target.input_id)
+
+        available_rate = get_byproduct_supply(input_key)
+        if available_rate <= 0:
+            return False
+
+        recipe = dataset.recipe_by_rid(target.recipe_rid)
+        if not recipe:
+            return False
+
+        tuning = tuning_for_recipe(recipe)
+        inputs = dataset.recipe_inputs(recipe["rid"])
+        outputs = dataset.recipe_outputs(recipe["rid"])
+        duration_ticks, _, parallel = apply_recipe_tuning(recipe, tuning)
+
+        target_output = None
+        if target.output_type == "item":
+            for out in outputs["items"]:
+                if out["item_id"] == target.output_id and out["meta"] == target.output_meta:
+                    target_output = out
+                    break
+            output_key = _item_key(target.output_id, target.output_meta)
+            output_node = ensure_item_node(target.output_id, target.output_meta)
+        else:
+            for out in outputs["fluids"]:
+                if out["fluid_id"] == target.output_id:
+                    target_output = out
+                    break
+            output_key = _fluid_key(target.output_id)
+            output_node = ensure_fluid_node(target.output_id)
+        if not target_output:
+            return False
+
+        input_match = None
+        if target.input_type == "item":
+            for inp in inputs["items"]:
+                if inp["item_id"] == target.input_id and inp["meta"] == target.input_meta:
+                    input_match = inp
+                    break
+        else:
+            for inp in inputs["fluids"]:
+                if inp["fluid_id"] == target.input_id:
+                    input_match = inp
+                    break
+        if not input_match:
+            return False
+
+        if target.input_type == "item":
+            per_machine_input_rate = rate_per_second(input_match["count"], duration_ticks)
+        else:
+            per_machine_input_rate = rate_per_second(input_match["mb"], duration_ticks)
+        total_input_rate = per_machine_input_rate * max(1, parallel)
+        if total_input_rate <= 0:
+            return False
+        machines_required = max(0.0, available_rate / total_input_rate)
+
+        chance_multiplier = _output_chance_multiplier(target_output)
+        if target.output_type == "item":
+            per_machine_output_rate = rate_per_second(
+                target_output["count"] * chance_multiplier, duration_ticks
+            )
+        else:
+            per_machine_output_rate = rate_per_second(
+                target_output["mb"] * chance_multiplier, duration_ticks
+            )
+        total_output_rate = per_machine_output_rate * max(1, parallel) * machines_required
+
+        recipe_node = ensure_recipe_node(recipe, tuning, total_output_rate, target_output, output_key)
+        nodes[recipe_node]["machines_required"] = machines_required
+        nodes[recipe_node]["machines_demand"] = machines_required
+        nodes[recipe_node]["per_machine_rate_per_s"] = per_machine_output_rate
+        nodes[recipe_node]["byproduct_input_key"] = input_key
+
+        if target.output_type == "item":
+            add_edge(
+                recipe_node,
+                output_node,
+                {
+                    "kind": "produces",
+                    "rate_per_s": total_output_rate,
+                    "count_per_cycle": target_output["count"],
+                    "chance": target_output.get("chance"),
+                },
+            )
+        else:
+            add_edge(
+                recipe_node,
+                output_node,
+                {
+                    "kind": "produces",
+                    "rate_per_s": total_output_rate,
+                    "mb_per_cycle": target_output["mb"],
+                    "chance": target_output.get("chance"),
+                },
+            )
+
+        next_path = {input_key}
+
+        for inp in inputs["items"]:
+            inp_node = ensure_item_node(inp["item_id"], inp["meta"])
+            req_rate = rate_per_second(inp["count"], duration_ticks) * machines_required
+            add_edge(
+                inp_node,
+                recipe_node,
+                {
+                    "kind": "consumes",
+                    "rate_per_s": req_rate,
+                    "count_per_cycle": inp["count"],
+                },
+            )
+            if target.input_type == "item" and inp["item_id"] == target.input_id and inp["meta"] == target.input_meta:
+                continue
+            expand_item(inp["item_id"], inp["meta"], req_rate, None, 1, next_path)
+
+        for inp in inputs["fluids"]:
+            inp_node = ensure_fluid_node(inp["fluid_id"])
+            req_rate = rate_per_second(inp["mb"], duration_ticks) * machines_required
+            add_edge(
+                inp_node,
+                recipe_node,
+                {
+                    "kind": "consumes",
+                    "rate_per_s": req_rate,
+                    "mb_per_cycle": inp["mb"],
+                },
+            )
+            if target.input_type == "fluid" and inp["fluid_id"] == target.input_id:
+                continue
+            expand_fluid(inp["fluid_id"], req_rate, None, 1, next_path)
+
+        for out in outputs["items"]:
+            if target.output_type == "item" and out["item_id"] == target.output_id and out["meta"] == target.output_meta:
+                continue
+            out_node = ensure_item_node(out["item_id"], out["meta"])
+            chance_multiplier = _output_chance_multiplier(out)
+            add_edge(
+                recipe_node,
+                out_node,
+                {
+                    "kind": "byproduct",
+                    "rate_per_s": rate_per_second(out["count"] * chance_multiplier, duration_ticks)
+                    * machines_required,
+                    "count_per_cycle": out["count"],
+                    "chance": out.get("chance"),
+                },
+            )
+
+        for out in outputs["fluids"]:
+            if target.output_type == "fluid" and out["fluid_id"] == target.output_id:
+                continue
+            out_node = ensure_fluid_node(out["fluid_id"])
+            chance_multiplier = _output_chance_multiplier(out)
+            add_edge(
+                recipe_node,
+                out_node,
+                {
+                    "kind": "byproduct",
+                    "rate_per_s": rate_per_second(out["mb"] * chance_multiplier, duration_ticks)
+                    * machines_required,
+                    "mb_per_cycle": out["mb"],
+                    "chance": out.get("chance"),
+                },
+            )
+        return True
 
     for target in req.targets:
         if target.target_type == "item":
-            expand_item(target.target_id, target.target_meta, target.target_rate_per_s, 0, set())
+            expand_item(
+                target.target_id,
+                target.target_meta,
+                target.target_rate_per_s,
+                target.target_machine_count,
+                0,
+                set(),
+            )
         else:
-            expand_fluid(target.target_id, target.target_rate_per_s, 0, set())
+            expand_fluid(
+                target.target_id,
+                target.target_rate_per_s,
+                target.target_machine_count,
+                0,
+                set(),
+            )
+
+    if req.byproduct_targets:
+        expanded: set[tuple[str, str, int, str, str, int, str]] = set()
+        progress = True
+        while progress:
+            progress = False
+            for byproduct_target in req.byproduct_targets:
+                key = (
+                    byproduct_target.input_type,
+                    byproduct_target.input_id,
+                    byproduct_target.input_meta,
+                    byproduct_target.output_type,
+                    byproduct_target.output_id,
+                    byproduct_target.output_meta,
+                    byproduct_target.recipe_rid,
+                )
+                if key in expanded:
+                    continue
+                if expand_byproduct_target(byproduct_target):
+                    expanded.add(key)
+                    progress = True
 
     return {
         "nodes": list(nodes.values()),
@@ -336,7 +669,12 @@ def build_graph(
                     "type": target.target_type,
                     "id": target.target_id,
                     "meta": target.target_meta,
-                    "rate_per_s": target.target_rate_per_s,
+                    "rate_per_s": target_rates.get(
+                        _item_key(target.target_id, target.target_meta)
+                        if target.target_type == "item"
+                        else _fluid_key(target.target_id),
+                        target.target_rate_per_s,
+                    ),
                 }
                 for target in req.targets
             ],

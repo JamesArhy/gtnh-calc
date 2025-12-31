@@ -61,6 +61,6 @@ def effective_parallel(tuning: MachineTuning, bonus: Optional[MachineBonus]) -> 
     return max(1.0, parallel)
 
 
-def rate_per_second(count: int, duration_ticks: int) -> float:
+def rate_per_second(count: float, duration_ticks: int) -> float:
     duration = max(1, duration_ticks)
-    return (count / duration) * TICKS_PER_SECOND
+    return (float(count) / duration) * TICKS_PER_SECOND

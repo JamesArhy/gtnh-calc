@@ -1,17 +1,28 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import cytoscape from "cytoscape"
 import cytoscapeSvg from "cytoscape-svg"
+import cytoscapeDagre from "cytoscape-dagre"
 import { jsPDF } from "jspdf"
 import { svg2pdf } from "svg2pdf.js"
 import type { GraphResponse, RecipeIOFluid, RecipeIOItem } from "./types"
-import { fetchGraph, fetchMachinesByOutput, fetchRecipesByOutput, searchFluids, searchItems } from "./api"
+import {
+  fetchGraph,
+  fetchMachinesByOutput,
+  fetchRecipesByInput,
+  fetchRecipesByOutput,
+  searchFluids,
+  searchItems
+} from "./api"
 
 cytoscape.use(cytoscapeSvg)
+cytoscape.use(cytoscapeDagre)
 
 const SEARCH_DEBOUNCE_MS = 300
 const OUTPUT_SEARCH_LIMIT = 30
 const TIERS = ["ULV", "LV", "MV", "HV", "EV", "IV", "LuV", "ZPM", "UV", "UHV"]
 const RECIPE_RESULTS_LIMIT = 200
+const BYPRODUCT_CHAIN_DEPTH = 3
+const RADIAL_MENU_MARGIN = 130
 const TIER_COLORS: Record<string, string> = {
   ULV: "#4DBE6B",
   LV: "#4DBE6B",
@@ -36,6 +47,120 @@ const TIER_CAPS: Record<string, number> = {
   UV: 524288,
   UHV: 2097152
 }
+const SVG_EXPORT_PADDING = 40
+const SVG_EXPORT_SCALE = 4
+const SVG_EXPORT_MITER_LIMIT = 10
+const PX_TO_PT = 72 / 96
+const EXPORT_MAX_EDGE_WIDTH = 4
+const EXPORT_EDGE_WIDTH_SCALE = 0.3
+const EXPORT_ARROW_SCALE = 0.7
+const EXPORT_STYLE_OVERRIDES: cytoscape.Stylesheet[] = [
+  {
+    selector: "node",
+    style: {
+      "text-background-opacity": 0,
+      "text-background-color": "transparent",
+      "text-background-padding": 0,
+      "text-background-shape": "rectangle"
+    }
+  },
+  {
+    selector: "node[export_padding = \"true\"]",
+    style: {
+      "background-opacity": 0,
+      "border-opacity": 0,
+      "width": 1,
+      "height": 1,
+      "label": ""
+    }
+  },
+  {
+    selector: "edge",
+    style: {
+      "width": 2,
+      "text-background-opacity": 0,
+      "text-background-color": "transparent",
+      "text-outline-width": 0,
+      "text-background-padding": 0,
+      "text-background-shape": "round-rectangle",
+      "text-background-opacity": 1,
+      "text-background-color": "#161311",
+      "overlay-opacity": 0,
+      "underlay-opacity": 0,
+      "shadow-opacity": 0,
+      "shadow-blur": 0,
+      "curve-style": "unbundled-bezier",
+      "edge-distances": "node-position",
+      "line-cap": "round",
+      "line-join": "round",
+      "arrow-scale": 0,
+      "line-opacity": 1,
+      "opacity": 1,
+      "target-arrow-shape": "none"
+    }
+  },
+  {
+    selector: "node[type = \"fluid\"]",
+    style: {
+      "background-color": "#4FA3D1",
+      "shape": "round-rectangle",
+      "corner-radius": 18,
+      "width": 68,
+      "height": 36,
+      "border-color": "#2C6D8F",
+      "border-width": 2
+    }
+  },
+  {
+    selector: "node[fluid_id]",
+    style: {
+      "background-color": "#4FA3D1",
+      "shape": "round-rectangle",
+      "corner-radius": 18,
+      "width": 68,
+      "height": 36,
+      "border-color": "#2C6D8F",
+      "border-width": 2
+    }
+  },
+  {
+    selector: "node[type = \"gas\"]",
+    style: {
+      "background-color": "#6EDDD8",
+      "shape": "hexagon",
+      "border-color": "#3BAFA9",
+      "border-width": 2
+    }
+  },
+  {
+    selector: "node[type = \"recipe\"]",
+    style: {
+      "background-fill": "solid"
+    }
+  },
+  {
+    selector: "edge[active = \"true\"]",
+    style: {
+      "width": 2,
+      "line-opacity": 0.85
+    }
+  },
+  {
+    selector: "edge[active = \"false\"]",
+    style: {
+      "width": 2,
+      "line-opacity": 0.5
+    }
+  },
+  {
+    selector: "edge[bottleneck = \"true\"]",
+    style: {
+      "width": 2,
+      "line-opacity": 0.9
+    }
+  }
+]
+const UTILIZATION_LOW = 0.5
 const GAS_FLUID_IDS = new Set<string>()
 const COIL_TYPES = [
   { id: "Any", label: "Any", maxTemp: Infinity },
@@ -62,11 +187,20 @@ type Target = {
   name?: string
 }
 
+type RateMode = "machines" | "output"
+
 type InputTarget = {
   key: string
   target: Target
   rate_per_s: number
   recipe?: RecipeOption
+}
+
+type ByproductTarget = {
+  id: string
+  input: Target
+  output: Target
+  recipe: RecipeOption
 }
 
 type MachineOption = {
@@ -97,8 +231,12 @@ type SavedConfig = {
   outputTarget: Target | null
   selectedRecipe: RecipeOption | null
   inputTargets: InputTarget[]
-  rateValue: number
-  rateUnit: "min" | "sec"
+  byproductTargets: ByproductTarget[]
+  outputMachineCount?: number
+  rateMode?: RateMode
+  rateValue?: number
+  machineCountOverrides?: Record<string, number>
+  rateUnit?: "min" | "sec"
   userVoltageTier: string
   maxCoilType: string
   recipeTierOverrides: Record<string, string>
@@ -121,31 +259,37 @@ export default function App() {
 
   const [outputTarget, setOutputTarget] = useState<Target | null>(null)
   const [selectedRecipe, setSelectedRecipe] = useState<RecipeOption | null>(null)
+  const [outputMachineCount, setOutputMachineCount] = useState(1)
+  const [rateMode, setRateMode] = useState<RateMode>("machines")
   const [rateValue, setRateValue] = useState(1)
+  const [machineCountOverrides, setMachineCountOverrides] = useState<Record<string, number>>({})
+  const [manualMachineCounts, setManualMachineCounts] = useState<Record<string, boolean>>({})
   const [rateUnit, setRateUnit] = useState<"min" | "sec">("min")
   const [userVoltageTier, setUserVoltageTier] = useState<string>("Any")
   const [maxCoilType, setMaxCoilType] = useState<string>("Any")
-  const lastTargetRatePerSRef = useRef<number>(rateUnit === "min" ? rateValue / 60 : rateValue)
-  const isScalingInputsRef = useRef(false)
   const [recipeTierOverrides, setRecipeTierOverrides] = useState<Record<string, string>>({})
   const [recipeOverclockTiers, setRecipeOverclockTiers] = useState<Record<string, number>>({})
   const [inputTargets, setInputTargets] = useState<InputTarget[]>([])
+  const [byproductTargets, setByproductTargets] = useState<ByproductTarget[]>([])
   const [inputRecipeOverrides, setInputRecipeOverrides] = useState<Record<string, string>>({})
 
   const [graph, setGraph] = useState<GraphResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [graphTab, setGraphTab] = useState<"graph" | "machines">("graph")
   const [configTab, setConfigTab] = useState<"outputs" | "inputs" | "options" | "saved">("outputs")
+  const [isGraphFullscreen, setIsGraphFullscreen] = useState(false)
 
   const [showOutputModal, setShowOutputModal] = useState(false)
   const [outputQuery, setOutputQuery] = useState("")
   const [outputResults, setOutputResults] = useState<Target[]>([])
   const [selectedOutput, setSelectedOutput] = useState<Target | null>(null)
   const [outputRecipes, setOutputRecipes] = useState<RecipeOption[]>([])
+  const [byproductRecipes, setByproductRecipes] = useState<RecipeOption[]>([])
   const [selectedMachineId, setSelectedMachineId] = useState<string | null>(null)
   const [isLoadingOutputs, setIsLoadingOutputs] = useState(false)
   const [isLoadingMachines, setIsLoadingMachines] = useState(false)
   const [isLoadingRecipes, setIsLoadingRecipes] = useState(false)
+  const [isLoadingByproductRecipes, setIsLoadingByproductRecipes] = useState(false)
   const [machinesForOutput, setMachinesForOutput] = useState<MachineOption[]>([])
   const [recentRecipes, setRecentRecipes] = useState<{ target: Target; recipe: RecipeOption }[]>(() => {
     const key = "gtnh_recent_recipes_v1"
@@ -166,6 +310,7 @@ export default function App() {
     lines: string[]
   } | null>(null)
   const [showFlowAnimation, setShowFlowAnimation] = useState(false)
+  const [showSecondaryOutputs, setShowSecondaryOutputs] = useState(true)
   const [radialMenu, setRadialMenu] = useState<
     | {
         kind: "target"
@@ -174,6 +319,7 @@ export default function App() {
         target: Target
         isOutput: boolean
         ratePerS: number | null
+        hasByproductSupply?: boolean
       }
     | {
         kind: "recipe"
@@ -181,14 +327,22 @@ export default function App() {
         y: number
         rid: string
         minTier?: string
+        outputKey?: string
+        machinesRequired?: number
+        machinesDemand?: number
+        targetRatePerS?: number | null
+        isByproductChain?: boolean
       }
     | null
   >(null)
+  const [radialMachineDraft, setRadialMachineDraft] = useState("")
   const graphRunTimerRef = useRef<number | null>(null)
   const isRestoringConfigRef = useRef(false)
   const [restoreVersion, setRestoreVersion] = useState(0)
-  const [selectionMode, setSelectionMode] = useState<"output" | "input">("output")
+  const [selectionMode, setSelectionMode] = useState<"output" | "input" | "byproduct">("output")
   const [pendingInputRate, setPendingInputRate] = useState<number | null>(null)
+  const [pendingByproductInput, setPendingByproductInput] = useState<Target | null>(null)
+  const [byproductConstraintEnabled, setByproductConstraintEnabled] = useState(false)
   const [machineTierSelections, setMachineTierSelections] = useState<Record<string, string>>({})
   const [savedConfigs, setSavedConfigs] = useState<SavedConfigEntry[]>(() => {
     const key = "gtnh_saved_configs_v1"
@@ -207,13 +361,103 @@ export default function App() {
   const getTargetKey = (target: Target) =>
     target.type === "item" ? `item:${target.id}:${target.meta}` : `fluid:${target.id}`
 
+  const getByproductTargetId = (input: Target, output: Target, rid: string) =>
+    `${getTargetKey(input)}->${getTargetKey(output)}:${rid}`
+
   const getRecipeNodeId = (rid: string, outputKeyValue: string) => `recipe:${rid}:${outputKeyValue}`
+
+  const getTargetFromKey = (key?: string): Target | null => {
+    if (!key) return null
+    if (key.startsWith("item:")) {
+      const raw = key.slice("item:".length)
+      const lastColon = raw.lastIndexOf(":")
+      if (lastColon <= 0) return null
+      const id = raw.slice(0, lastColon)
+      const meta = Number(raw.slice(lastColon + 1))
+      if (!Number.isFinite(meta)) return null
+      return { type: "item", id, meta }
+    }
+    if (key.startsWith("fluid:")) {
+      const id = key.slice("fluid:".length)
+      if (!id) return null
+      return { type: "fluid", id, meta: 0 }
+    }
+    return null
+  }
 
   const outputKey = outputTarget
     ? outputTarget.type === "item"
       ? `item:${outputTarget.id}:${outputTarget.meta}`
       : `fluid:${outputTarget.id}`
     : null
+
+  const clampWholeNumber = (value: number, min: number) => {
+    if (!Number.isFinite(value)) return min
+    return Math.max(min, Math.floor(value))
+  }
+  const clampValue = (value: number, min: number, max: number) =>
+    Math.min(Math.max(value, min), max)
+  const clampMenuPosition = (value: number, size: number, margin: number) => {
+    if (size <= margin * 2) return size / 2
+    return clampValue(value, margin, size - margin)
+  }
+  const parseMachineCount = (rawValue: string, min: number) => {
+    const parsed = Number(rawValue)
+    if (!Number.isFinite(parsed)) return null
+    return clampWholeNumber(parsed, min)
+  }
+
+  const radialRecipeMenu = radialMenu?.kind === "recipe" ? radialMenu : null
+  const radialIsOutputRecipe =
+    radialRecipeMenu?.rid === selectedRecipe?.rid && radialRecipeMenu?.outputKey === outputKey
+  const radialCanEditMachines = !radialRecipeMenu?.isByproductChain
+  const radialMinValue = radialIsOutputRecipe ? 1 : 0
+  const radialMachineCountValue = radialRecipeMenu
+    ? (() => {
+        const fallback = Number.isFinite(radialRecipeMenu.machinesDemand)
+          ? Math.max(0, Math.ceil(radialRecipeMenu.machinesDemand || 0))
+          : clampWholeNumber(radialRecipeMenu.machinesRequired || 0, 0)
+        if (radialIsOutputRecipe) return outputMachineCount
+        if (!radialRecipeMenu.outputKey) return fallback
+        return machineCountOverrides[radialRecipeMenu.outputKey] ?? fallback
+      })()
+    : 0
+  const applyRadialMachineCount = (nextValue: number) => {
+    if (!radialRecipeMenu) return
+    if (!radialCanEditMachines) return
+    if (rateMode !== "machines") {
+      setRateMode("machines")
+    }
+    if (radialIsOutputRecipe) {
+      setOutputMachineCount(nextValue)
+      return
+    }
+    if (!radialRecipeMenu.outputKey) return
+    setMachineCountOverrides(prev => ({
+      ...prev,
+      [radialRecipeMenu.outputKey]: nextValue
+    }))
+    setManualMachineCounts(prev => ({
+      ...prev,
+      [radialRecipeMenu.outputKey]: true
+    }))
+  }
+
+  useEffect(() => {
+    if (!radialRecipeMenu) {
+      setRadialMachineDraft("")
+      return
+    }
+    setRadialMachineDraft(String(radialMachineCountValue))
+  }, [radialRecipeMenu, radialMachineCountValue])
+
+  const handleRadialMachineInput = (rawValue: string) => {
+    if (!radialCanEditMachines) return
+    setRadialMachineDraft(rawValue)
+    const nextValue = parseMachineCount(rawValue, radialMinValue)
+    if (nextValue === null) return
+    applyRadialMachineCount(nextValue)
+  }
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -245,7 +489,9 @@ export default function App() {
             "text-background-shape": "round-rectangle",
             "width": 52,
             "height": 52,
-            "shape": "round-hexagon"
+            "shape": "round-hexagon",
+            "z-index-compare": "manual",
+            "z-index": 1
           }
         },
         {
@@ -262,7 +508,48 @@ export default function App() {
             "height": 60,
             "text-max-width": "160px",
             "transition-property": "border-color border-width",
-            "transition-duration": 150
+            "transition-duration": 150,
+            "z-index": 5
+          }
+        },
+        {
+          selector: "node[type = \"recipe\"].util-low",
+          style: {
+            "border-color": "#4FA3D1",
+            "border-width": 4
+          }
+        },
+        {
+          selector: "node.machine-badge",
+          style: {
+            "background-color": "#EAD6A8",
+            "background-opacity": 0.92,
+            "background-fill": "solid",
+            "border-color": "#6B4D33",
+            "border-width": 1,
+            "label": "data(label)",
+            "font-family": "Space Grotesk, sans-serif",
+            "font-weight": "700",
+            "font-size": "9px",
+            "color": "#2B1F14",
+            "text-valign": "center",
+            "text-halign": "center",
+            "text-wrap": "none",
+            "text-margin-y": 0,
+            "text-background-opacity": 0,
+            "text-outline-width": 0,
+            "text-opacity": 1,
+            "width": 34,
+            "height": 16,
+            "shape": "round-rectangle",
+            "opacity": 0.95,
+            "border-opacity": 1,
+            "shadow-opacity": 0,
+            "shadow-blur": 0,
+            "shadow-offset-y": 0,
+            "z-index": 30,
+            "z-index-compare": "manual",
+            "events": "no"
           }
         },
         {
@@ -292,10 +579,15 @@ export default function App() {
             "line-color": "#C9A26B",
             "target-arrow-color": "#C9A26B",
             "target-arrow-shape": "triangle",
-            "curve-style": "straight",
+            "curve-style": "taxi",
+            "taxi-direction": "horizontal",
+            "taxi-radius": 8,
+            "edge-distances": "node-position",
             "width": "data(edge_width)",
             "line-opacity": 0.55,
             "arrow-scale": 0.8,
+            "line-cap": "round",
+            "line-join": "round",
             "label": "data(label)",
             "font-family": "Space Grotesk, sans-serif",
             "font-size": "10px",
@@ -342,6 +634,47 @@ export default function App() {
           style: {
             "opacity": 0.4,
             "line-opacity": 0.3
+          }
+        },
+        {
+          selector: "edge[back_edge = \"true\"]",
+          style: {
+            "curve-style": "bezier",
+            "control-point-step-size": 140,
+            "line-style": "dashed",
+            "line-dash-pattern": [8, 6]
+          }
+        },
+        {
+          selector: "edge[kind = \"byproduct\"]",
+          style: {
+            "curve-style": "taxi",
+            "taxi-direction": "horizontal",
+            "taxi-radius": 8,
+            "line-style": "dashed",
+            "line-dash-pattern": [6, 4],
+            "line-cap": "round",
+            "opacity": 1,
+            "line-opacity": 0.7
+          }
+        },
+        {
+          selector: "edge[byproduct_chain = \"true\"]",
+          style: {
+            "curve-style": "taxi",
+            "taxi-direction": "horizontal",
+            "taxi-radius": 8,
+            "line-style": "dotted",
+            "line-dash-pattern": [2, 6],
+            "width": "data(edge_width)",
+            "line-opacity": 0.9,
+            "line-cap": "round",
+            "arrow-scale": 0.7,
+            "source-arrow-shape": "none",
+            "target-arrow-shape": "triangle",
+            "line-color": "#6ECFF6",
+            "target-arrow-color": "#6ECFF6",
+            "text-margin-y": -12
           }
         },
         {
@@ -413,6 +746,16 @@ export default function App() {
             "opacity": 0.2
           }
         }
+        ,
+        {
+          selector: "node.machine-badge.dimmed",
+          style: {
+            "opacity": 1,
+            "text-opacity": 1,
+            "background-opacity": 1,
+            "border-opacity": 1
+          }
+        }
       ],
       layout: {
         name: "breadthfirst",
@@ -421,6 +764,7 @@ export default function App() {
         spacingFactor: 1.2,
         nodeDimensionsIncludeLabels: true
       },
+      wheelSensitivity: 0.08,
       minZoom: 0.2,
       maxZoom: 2
     })
@@ -435,6 +779,12 @@ export default function App() {
       const insideSection =
         (target && section.contains(target)) || (path.length > 0 && path.includes(section))
       if (insideSection) {
+        if (target instanceof HTMLElement) {
+          const tag = target.tagName
+          if (target.isContentEditable || tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+            return
+          }
+        }
         event.preventDefault()
         event.stopPropagation()
       }
@@ -447,6 +797,44 @@ export default function App() {
     }
   }, [])
 
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      const section = graphSectionRef.current
+      const isFullscreen = !!section && document.fullscreenElement === section
+      setIsGraphFullscreen(isFullscreen)
+      if (cyRef.current) {
+        requestAnimationFrame(() => {
+          cyRef.current?.resize()
+        })
+      }
+    }
+
+    const handleKeydown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return
+      const section = graphSectionRef.current
+      if (section && document.fullscreenElement === section) {
+        document.exitFullscreen().catch(() => null)
+      }
+    }
+
+    document.addEventListener("fullscreenchange", handleFullscreenChange)
+    document.addEventListener("keydown", handleKeydown)
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange)
+      document.removeEventListener("keydown", handleKeydown)
+    }
+  }, [])
+
+  const toggleGraphFullscreen = async () => {
+    const section = graphSectionRef.current
+    if (!section) return
+    if (document.fullscreenElement === section) {
+      await document.exitFullscreen().catch(() => null)
+      return
+    }
+    await section.requestFullscreen().catch(() => null)
+  }
+
   const formatMachineMultiplier = (value?: number) => {
     if (value === undefined || Number.isNaN(value)) return "?"
     if (Number.isInteger(value)) return String(value)
@@ -456,6 +844,23 @@ export default function App() {
   }
   const formatRateValue = (value: number) =>
     Number.isInteger(value) ? String(value) : value.toFixed(1)
+  const getRatePerS = (value: number, unit = rateUnit) =>
+    unit === "min" ? value / 60 : value
+  const convertRateValue = (value: number, from: "min" | "sec", to: "min" | "sec") => {
+    if (from === to) return value
+    return from === "min" ? value / 60 : value * 60
+  }
+
+  const targetLabelLookup = useMemo(() => {
+    const lookup = new Map<string, string>()
+    if (!graph) return lookup
+    graph.nodes.forEach(node => {
+      if (node.type !== "item" && node.type !== "fluid") return
+      if (!node.label) return
+      lookup.set(node.id, node.label)
+    })
+    return lookup
+  }, [graph])
 
   const formatEnergy = (value?: number) => {
     if (value === undefined || Number.isNaN(value)) return "?"
@@ -474,15 +879,56 @@ export default function App() {
   }
 
   const formatTargetName = (target: Target) => {
-    if (target.type === "fluid") return formatFluidName(target.name, target.id)
-    return target.name || target.id
+    const fallback = targetLabelLookup.get(getTargetKey(target))
+    if (target.type === "fluid") {
+      const name = formatFluidName(target.name, target.id)
+      return fallback || name
+    }
+    return target.name || fallback || target.id
   }
 
   const getRecipeEnergy = (recipe: RecipeOption) => recipe.duration_ticks * recipe.eut
-  const getRatePerS = (value: number, unit: "min" | "sec") => (unit === "min" ? value / 60 : value)
   const formatRateNumber = (value: number, decimals: number) => {
     const fixed = value.toFixed(decimals)
     return fixed.replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1")
+  }
+  const formatOutputRate = (ratePerS: number | null) => {
+    if (ratePerS === null || !Number.isFinite(ratePerS)) {
+      return `--/${rateUnit === "min" ? "min" : "s"}`
+    }
+    const value = rateUnit === "min" ? ratePerS * 60 : ratePerS
+    return `${formatRateValue(value)}/${rateUnit === "min" ? "min" : "s"}`
+  }
+  const formatUtilization = (value: number) => {
+    if (!Number.isFinite(value)) return "?"
+    const percent = value * 100
+    const fixed = percent.toFixed(1)
+    return fixed.endsWith(".0") ? `${Math.round(percent)}%` : `${fixed}%`
+  }
+  const getOutputRateFromMachines = () => {
+    if (!outputTarget || !selectedRecipe) return null
+    const output =
+      outputTarget.type === "item"
+        ? selectedRecipe.item_outputs?.find(
+            item => item.item_id === outputTarget.id && item.meta === outputTarget.meta
+          )
+        : selectedRecipe.fluid_outputs?.find(fluid => fluid.fluid_id === outputTarget.id)
+    if (!output) return null
+    const perCycle =
+      outputTarget.type === "item"
+        ? (output as RecipeIOItem).count
+        : (output as RecipeIOFluid).mb
+    if (!perCycle || perCycle <= 0) return null
+    const baseDuration =
+      selectedRecipe.duration_ticks ?? selectedRecipe.base_duration_ticks ?? 0
+    let duration = Math.max(1, Math.floor(baseDuration))
+    const overclocks = Math.max(0, recipeOverclockTiers[selectedRecipe.rid] ?? 0)
+    for (let i = 0; i < overclocks; i += 1) {
+      duration = Math.max(1, Math.floor(duration / 2))
+    }
+    const perMachineRate = (perCycle / duration) * 20
+    const machineCount = clampWholeNumber(outputMachineCount, 1)
+    return perMachineRate * machineCount
   }
   const formatItemRate = (ratePerS: number) =>
     rateUnit === "min"
@@ -499,6 +945,11 @@ export default function App() {
     const unit = rateUnit === "min" ? "L/min" : "L/s"
     const decimals = liters >= 10 ? 1 : 2
     return `${formatRateNumber(liters, decimals)} ${unit}`
+  }
+  const formatChanceLabel = (chance?: number | null) => {
+    if (chance === undefined || chance === null || Number.isNaN(chance)) return null
+    const percent = chance <= 1 ? chance * 100 : chance
+    return `${formatRateNumber(percent, percent < 10 ? 1 : 0)}%`
   }
   const getTargetForNode = (node: any): Target | null => {
     if (!node) return null
@@ -529,10 +980,15 @@ export default function App() {
       .reduce((sum, edge) => sum + edge.rate_per_s, 0)
     return total > 0 ? total : null
   }
+  const getUtilizationState = (utilization: number | null) => {
+    if (utilization === null) return null
+    if (utilization <= UTILIZATION_LOW) return "low"
+    return null
+  }
 
   const getFooterSegments = () => ({
     left: outputTarget ? `${formatTargetName(outputTarget)} Line` : "No output selected",
-    middle: `${formatRateValue(rateUnit === "min" ? rateValue : rateValue * 60)}/min`,
+    middle: formatOutputRate(outputRatePerS),
     right: totalEnergyPerTick !== null ? `${formatEnergy(totalEnergyPerTick)} EU/t` : "EU/t"
   })
 
@@ -653,33 +1109,35 @@ export default function App() {
   useEffect(() => {
     if (!outputTarget || !selectedRecipe) return
     if (isRestoringConfigRef.current) return
-    if (isScalingInputsRef.current) {
-      isScalingInputsRef.current = false
-      scheduleGraphRun(0)
-      return
-    }
     scheduleGraphRun()
-  }, [inputTargets])
+  }, [inputTargets, byproductTargets])
 
   useEffect(() => {
     if (!outputTarget || !selectedRecipe) return
     if (isRestoringConfigRef.current) return
-    const nextRatePerS = getRatePerS(rateValue, rateUnit)
-    const prevRatePerS = lastTargetRatePerSRef.current
-    if (prevRatePerS > 0 && nextRatePerS !== prevRatePerS && inputTargets.length > 0) {
-      const scale = nextRatePerS / prevRatePerS
-      isScalingInputsRef.current = true
-      setInputTargets(prev =>
-        prev.map(entry => ({
-          ...entry,
-          rate_per_s: entry.rate_per_s * scale
-        }))
-      )
-    } else {
-      runGraph()
-    }
-    lastTargetRatePerSRef.current = nextRatePerS
-  }, [rateValue, rateUnit])
+    if (rateMode !== "machines") return
+    scheduleGraphRun()
+  }, [outputMachineCount, rateMode])
+
+  useEffect(() => {
+    if (!outputTarget || !selectedRecipe) return
+    if (isRestoringConfigRef.current) return
+    if (rateMode !== "output") return
+    scheduleGraphRun()
+  }, [rateValue, rateMode])
+
+  useEffect(() => {
+    if (!outputTarget || !selectedRecipe) return
+    if (isRestoringConfigRef.current) return
+    scheduleGraphRun()
+  }, [rateMode])
+
+  useEffect(() => {
+    if (!outputTarget || !selectedRecipe) return
+    if (isRestoringConfigRef.current) return
+    if (rateMode !== "machines") return
+    scheduleGraphRun()
+  }, [machineCountOverrides, rateMode])
 
   useEffect(() => {
     if (!outputTarget || !selectedRecipe) return
@@ -688,28 +1146,317 @@ export default function App() {
   }, [recipeOverclockTiers])
 
   useEffect(() => {
+    if (!graph || rateMode !== "machines" || !outputKey) return
+    if (isRestoringConfigRef.current) return
+    const nextOverrides = { ...machineCountOverrides }
+    let changed = false
+    graph.nodes.forEach(node => {
+      if (node.type !== "recipe") return
+      const nodeOutputKey = node.output_key
+      if (!nodeOutputKey || nodeOutputKey === outputKey) return
+      if (manualMachineCounts[nodeOutputKey]) return
+      if (!Number.isFinite(node.machines_demand)) return
+      const suggested = Math.max(0, Math.ceil(node.machines_demand))
+      if (nextOverrides[nodeOutputKey] !== suggested) {
+        nextOverrides[nodeOutputKey] = suggested
+        changed = true
+      }
+    })
+    if (changed) {
+      setMachineCountOverrides(nextOverrides)
+    }
+  }, [graph, rateMode, outputKey, manualMachineCounts, machineCountOverrides])
+
+  const utilizationByRecipeId = useMemo(() => {
+    if (!graph || rateMode !== "machines") return new Map<string, number>()
+    const supplyByNode = new Map<string, number>()
+    const demandByNode = new Map<string, number>()
+    const produceCountByNode = new Map<string, number>()
+    const demandCountByNode = new Map<string, number>()
+    const inputsByRecipe = new Map<string, typeof graph.edges>()
+    const outputsByRecipe = new Map<string, typeof graph.edges>()
+
+    graph.edges.forEach(edge => {
+      if (edge.kind === "consumes") {
+        demandByNode.set(edge.source, (demandByNode.get(edge.source) ?? 0) + edge.rate_per_s)
+        demandCountByNode.set(edge.source, (demandCountByNode.get(edge.source) ?? 0) + 1)
+        const list = inputsByRecipe.get(edge.target) || []
+        list.push(edge)
+        inputsByRecipe.set(edge.target, list)
+      } else {
+        supplyByNode.set(edge.target, (supplyByNode.get(edge.target) ?? 0) + edge.rate_per_s)
+        produceCountByNode.set(edge.target, (produceCountByNode.get(edge.target) ?? 0) + 1)
+        if (edge.kind === "produces") {
+          const list = outputsByRecipe.get(edge.source) || []
+          list.push(edge)
+          outputsByRecipe.set(edge.source, list)
+        }
+      }
+    })
+
+    const inputAvailabilityByNode = new Map<string, number>()
+    graph.nodes.forEach(node => {
+      if (node.type === "recipe") return
+      const supply = supplyByNode.get(node.id) ?? 0
+      const demand = demandByNode.get(node.id) ?? 0
+      const hasSupply = (produceCountByNode.get(node.id) ?? 0) > 0
+      if (!hasSupply) {
+        inputAvailabilityByNode.set(node.id, 1)
+        return
+      }
+      if (demand <= 0) {
+        inputAvailabilityByNode.set(node.id, 1)
+        return
+      }
+      const ratio = supply / demand
+      inputAvailabilityByNode.set(node.id, Math.min(1, Math.max(0, ratio)))
+    })
+
+    const getOutputDemandRatio = (nodeId: string) => {
+      const supply = supplyByNode.get(nodeId) ?? 0
+      const demand = demandByNode.get(nodeId) ?? 0
+      const hasDemand = (demandCountByNode.get(nodeId) ?? 0) > 0
+      if (!hasDemand) return null
+      if (supply <= 0) return 0
+      return Math.min(1, Math.max(0, demand / supply))
+    }
+
+    const utilization = new Map<string, number>()
+    graph.nodes.forEach(node => {
+      if (node.type !== "recipe") return
+      if (!Number.isFinite(node.machines_required) || (node.machines_required ?? 0) <= 0) {
+        utilization.set(node.id, 0)
+        return
+      }
+      const ratios: number[] = []
+      const inputs = inputsByRecipe.get(node.id) || []
+      inputs.forEach(edge => {
+        ratios.push(inputAvailabilityByNode.get(edge.source) ?? 1)
+      })
+      const outputs = outputsByRecipe.get(node.id) || []
+      outputs.forEach(edge => {
+        const ratio = getOutputDemandRatio(edge.target)
+        if (ratio !== null) {
+          ratios.push(ratio)
+        }
+      })
+      if (ratios.length === 0) {
+        utilization.set(node.id, 1)
+        return
+      }
+      utilization.set(node.id, Math.min(...ratios))
+    })
+    return utilization
+  }, [graph, rateMode])
+
+  useEffect(() => {
     if (!cyRef.current || !graph) return
     const cy = cyRef.current
     cy.elements().remove()
 
-    const nodeMap = new Map(graph.nodes.map(node => [node.id, node]))
+    const edgesForViz = showSecondaryOutputs
+      ? graph.edges
+      : graph.edges.filter(edge => edge.kind !== "byproduct")
+    const connectedNodeIds = new Set<string>()
+    edgesForViz.forEach(edge => {
+      connectedNodeIds.add(edge.source)
+      connectedNodeIds.add(edge.target)
+    })
+    const nodesForViz = graph.nodes.filter(
+      node => node.type === "recipe" || connectedNodeIds.has(node.id)
+    )
+    const nodeMap = new Map(nodesForViz.map(node => [node.id, node]))
+    const edgesBySource = new Map<string, typeof graph.edges>()
+    const edgesByTarget = new Map<string, typeof graph.edges>()
+    edgesForViz.forEach(edge => {
+      const outgoing = edgesBySource.get(edge.source) || []
+      outgoing.push(edge)
+      edgesBySource.set(edge.source, outgoing)
+      const incoming = edgesByTarget.get(edge.target) || []
+      incoming.push(edge)
+      edgesByTarget.set(edge.target, incoming)
+    })
+
+    const byproductChainEdgeIds = new Set<string>()
+    const byproductChainNodeIds = new Set<string>()
+    const byproductAnchors: string[] = []
+    const anchorForNode = new Map<string, string>()
+    const anchorSourceMap = new Map<string, string>()
+    const chainDepth = new Map<string, number>()
+    const anchorDirection = new Map<string, number>()
+
+    edgesForViz.forEach(edge => {
+      if (edge.kind !== "byproduct") return
+      if (!nodeMap.has(edge.target)) return
+      byproductChainEdgeIds.add(edge.id)
+      byproductChainNodeIds.add(edge.target)
+      if (!anchorForNode.has(edge.target)) {
+        byproductAnchors.push(edge.target)
+        anchorForNode.set(edge.target, edge.target)
+        chainDepth.set(edge.target, 0)
+      }
+      anchorSourceMap.set(edge.target, edge.source)
+    })
+
+    const chainQueue = [...byproductAnchors]
+    while (chainQueue.length > 0) {
+      const nodeId = chainQueue.shift() as string
+      const node = nodeMap.get(nodeId)
+      if (!node) continue
+      const baseDepth = chainDepth.get(nodeId) ?? 0
+      const anchorId = anchorForNode.get(nodeId) ?? nodeId
+      if (node.type === "recipe" && node.byproduct_input_key) {
+        const outgoing = edgesBySource.get(nodeId) || []
+        for (const edge of outgoing) {
+          if (edge.kind === "consumes") continue
+          byproductChainEdgeIds.add(edge.id)
+          const targetId = edge.target
+          if (!byproductChainNodeIds.has(targetId)) {
+            byproductChainNodeIds.add(targetId)
+            anchorForNode.set(targetId, anchorId)
+            chainDepth.set(targetId, baseDepth + 1)
+            chainQueue.push(targetId)
+          }
+        }
+      } else {
+        const outgoing = edgesBySource.get(nodeId) || []
+        for (const edge of outgoing) {
+          if (edge.kind !== "consumes") continue
+          const targetNode = nodeMap.get(edge.target)
+          if (!targetNode || targetNode.type !== "recipe") continue
+          if (targetNode.byproduct_input_key !== nodeId) continue
+          byproductChainEdgeIds.add(edge.id)
+          if (!byproductChainNodeIds.has(edge.target)) {
+            byproductChainNodeIds.add(edge.target)
+            anchorForNode.set(edge.target, anchorId)
+            chainDepth.set(edge.target, baseDepth + 1)
+            chainQueue.push(edge.target)
+          }
+        }
+      }
+    }
+
     const targetNodeIds = new Set<string>()
     if (outputKey) {
       targetNodeIds.add(outputKey)
     }
     inputTargets.forEach(entry => targetNodeIds.add(entry.key))
-    const edgesByTarget = new Map<string, typeof graph.edges>()
-    graph.edges.forEach(edge => {
-      const list = edgesByTarget.get(edge.target) || []
-      list.push(edge)
-      edgesByTarget.set(edge.target, list)
+    byproductTargets.forEach(entry => targetNodeIds.add(getTargetKey(entry.output)))
+    const protectedNodeIds = new Set<string>([...targetNodeIds, ...byproductChainNodeIds])
+    const collapseMaterialNodes = () => {
+      const removedNodeIds = new Set<string>()
+      const removedEdgeIds = new Set<string>()
+      const addedEdges: any[] = []
+      nodesForViz.forEach(node => {
+        if (!["item", "fluid", "gas"].includes(node.type)) return
+        if (protectedNodeIds.has(node.id)) return
+        const inEdges = edgesByTarget.get(node.id) || []
+        const outEdges = edgesBySource.get(node.id) || []
+        if (inEdges.length !== 1 || outEdges.length !== 1) return
+        const inEdge = inEdges[0]
+        const outEdge = outEdges[0]
+        if (inEdge.kind === "byproduct" || outEdge.kind === "byproduct") return
+        const sourceNode = nodeMap.get(inEdge.source)
+        const targetNode = nodeMap.get(outEdge.target)
+        if (!sourceNode || !targetNode) return
+        if (sourceNode.type !== "recipe" || targetNode.type !== "recipe") return
+        const supplyRate = inEdge.rate_per_s
+        const demandRate = outEdge.rate_per_s
+        const materialLabel = node.label || node.item_id || node.fluid_id
+        if (!materialLabel) return
+        const isGas = node.type === "fluid" && GAS_FLUID_IDS.has(node.fluid_id || "")
+        const supplyRatio =
+          typeof demandRate === "number" && demandRate > 0
+            ? Math.min(1, Math.max(0, supplyRate / demandRate))
+            : 1
+        addedEdges.push({
+          id: `flow:${node.id}`,
+          source: inEdge.source,
+          target: outEdge.target,
+          kind: "produces",
+          rate_per_s: demandRate,
+          material_label: materialLabel,
+          material_state: isGas ? "gas" : node.type === "fluid" ? "fluid" : "solid",
+          supply_ratio: supplyRatio
+        })
+        removedNodeIds.add(node.id)
+        removedEdgeIds.add(inEdge.id)
+        removedEdgeIds.add(outEdge.id)
+      })
+      const nextNodes = nodesForViz.filter(node => !removedNodeIds.has(node.id))
+      const nextEdges = edgesForViz
+        .filter(edge => !removedEdgeIds.has(edge.id))
+        .concat(addedEdges)
+      return { nodes: nextNodes, edges: nextEdges }
+    }
+    const { nodes: vizNodes, edges: vizEdges } = collapseMaterialNodes()
+    const vizNodeMap = new Map(vizNodes.map(node => [node.id, node]))
+    const vizEdgesBySource = new Map<string, typeof graph.edges>()
+    const vizEdgesByTarget = new Map<string, typeof graph.edges>()
+    vizEdges.forEach(edge => {
+      const outgoing = vizEdgesBySource.get(edge.source) || []
+      outgoing.push(edge)
+      vizEdgesBySource.set(edge.source, outgoing)
+      const incoming = vizEdgesByTarget.get(edge.target) || []
+      incoming.push(edge)
+      vizEdgesByTarget.set(edge.target, incoming)
+    })
+
+    const mainlineEdgeIds = new Set(
+      vizEdges
+        .filter(edge => !byproductChainEdgeIds.has(edge.id))
+        .map(edge => edge.id)
+    )
+    const mainlineNodeIds = new Set<string>()
+    vizEdges.forEach(edge => {
+      if (!mainlineEdgeIds.has(edge.id)) return
+      mainlineNodeIds.add(edge.source)
+      mainlineNodeIds.add(edge.target)
+    })
+    if (outputKey) {
+      mainlineNodeIds.add(outputKey)
+    }
+    const chainNodesByAnchor = new Map<string, Set<string>>()
+    byproductChainNodeIds.forEach(nodeId => {
+      const anchorId = anchorForNode.get(nodeId)
+      if (!anchorId) return
+      const list = chainNodesByAnchor.get(anchorId) || new Set<string>()
+      list.add(nodeId)
+      chainNodesByAnchor.set(anchorId, list)
+    })
+    byproductAnchors.forEach(anchorId => {
+      const chainNodes = chainNodesByAnchor.get(anchorId) || new Set<string>()
+      let feedsBack = false
+      vizEdges.forEach(edge => {
+        if (feedsBack) return
+        if (edge.kind !== "consumes") return
+        if (!chainNodes.has(edge.source)) return
+        if (!mainlineNodeIds.has(edge.target)) return
+        feedsBack = true
+      })
+      anchorDirection.set(anchorId, feedsBack ? -1 : 1)
+    })
+    const supplyByTarget = new Map<string, { total: number; count: number }>()
+    const demandBySource = new Map<string, { total: number; count: number }>()
+    vizEdges.forEach(edge => {
+      if (edge.kind === "consumes") {
+        const entry = demandBySource.get(edge.source) || { total: 0, count: 0 }
+        entry.total += edge.rate_per_s
+        entry.count += 1
+        demandBySource.set(edge.source, entry)
+        return
+      }
+      const entry = supplyByTarget.get(edge.target) || { total: 0, count: 0 }
+      entry.total += edge.rate_per_s
+      entry.count += 1
+      supplyByTarget.set(edge.target, entry)
     })
     const activeEdgeIds = new Set<string>()
     const visitedNodes = new Set<string>()
     const visitUpstream = (nodeId: string) => {
       if (visitedNodes.has(nodeId)) return
       visitedNodes.add(nodeId)
-      const incomingEdges = edgesByTarget.get(nodeId) || []
+      const incomingEdges = vizEdgesByTarget.get(nodeId) || []
       for (const edge of incomingEdges) {
         if (edge.kind === "byproduct") continue
         activeEdgeIds.add(edge.id)
@@ -719,31 +1466,36 @@ export default function App() {
     targetNodeIds.forEach(nodeId => visitUpstream(nodeId))
 
     const nodeFlows = new Map<string, { produced: number; consumed: number }>()
-    graph.edges.forEach(edge => {
+    const supplyCountByNode = new Map<string, number>()
+    vizEdges.forEach(edge => {
       if (edge.kind === "consumes") {
         const flow = nodeFlows.get(edge.source) || { produced: 0, consumed: 0 }
         flow.consumed += edge.rate_per_s
         nodeFlows.set(edge.source, flow)
+        supplyCountByNode.set(edge.source, supplyCountByNode.get(edge.source) ?? 0)
       } else {
         const flow = nodeFlows.get(edge.target) || { produced: 0, consumed: 0 }
         flow.produced += edge.rate_per_s
         nodeFlows.set(edge.target, flow)
+        supplyCountByNode.set(edge.target, (supplyCountByNode.get(edge.target) ?? 0) + 1)
       }
     })
-    const recipeNameCounts = graph.nodes.reduce<Record<string, number>>((acc, node) => {
+    const recipeNameCounts = vizNodes.reduce<Record<string, number>>((acc, node) => {
       if (node.type !== "recipe") return acc
       const name = node.machine_name || node.machine_id || node.label
       acc[name] = (acc[name] || 0) + 1
       return acc
     }, {})
-    const formatRecipeLabel = (node: any) => {
+    const formatRecipeLabel = (node: any, utilizationState: "low" | null) => {
       const name = node.machine_name || node.machine_id || node.label
-      const machines = formatMachineMultiplier(node.machines_required)
       const tier = getTierForRid(node.rid, node.min_tier)
-      const base = `${machines}x ${name}\n${tier}`
+      let base = `${name}\n${tier}`
       if (recipeNameCounts[name] > 1) {
         const ridSuffix = (node.rid || "").split(":").pop() || node.rid || "????"
-        return `${base}\n${ridSuffix.slice(-4).toUpperCase()}`
+        base = `${base}\n${ridSuffix.slice(-4).toUpperCase()}`
+      }
+      if (utilizationState === "low") {
+        return `${base}\n[LO]`
       }
       return base
     }
@@ -758,34 +1510,64 @@ export default function App() {
       return 6
     }
 
+    const badgeNodes = vizNodes
+      .filter(node => node.type === "recipe" && typeof node.machines_required === "number")
+      .map(node => ({
+        classes: "machine-badge",
+        data: {
+          id: `badge:${node.id}`,
+          label: `x${formatMachineMultiplier(node.machines_required)}`,
+          badge_for: node.id,
+          type: "badge"
+        },
+        selectable: false,
+        grabbable: false,
+        locked: true
+      }))
+
     const elements = [
-      ...graph.nodes.map(node => {
+      ...vizNodes.map(node => {
         const isGas = node.type === "fluid" && GAS_FLUID_IDS.has(node.fluid_id || "")
         const nodeType = node.type === "fluid" && isGas ? "gas" : node.type
+        const utilization =
+          nodeType === "recipe" && rateMode === "machines"
+            ? utilizationByRecipeId.get(node.id) ?? null
+            : null
+        const utilizationState =
+          nodeType === "recipe" && rateMode === "machines"
+            ? getUtilizationState(utilization)
+            : null
         const label =
           nodeType === "recipe"
-            ? formatRecipeLabel(node)
+            ? formatRecipeLabel(node, utilizationState)
             : nodeType === "fluid" || nodeType === "gas"
               ? formatFluidName(node.label, node.fluid_id)
               : node.label
         const tier = nodeType === "recipe" ? getTierForRid(node.rid, node.min_tier) : undefined
         return {
+          classes: utilizationState ? `util-${utilizationState}` : "",
           data: {
             ...node,
             type: nodeType,
             label,
             tier,
             tier_color: nodeType === "recipe" ? getTierColor(tier) : undefined,
-            power_state: nodeType === "recipe" ? getPowerState(node.eut, tier) : "ok"
+            power_state: nodeType === "recipe" ? getPowerState(node.eut, tier) : "ok",
+            utilization
           }
         }
       }),
-      ...graph.edges.map(edge => ({
+      ...badgeNodes,
+      ...vizEdges
+        .filter(edge => vizNodeMap.has(edge.source) && vizNodeMap.has(edge.target))
+        .map(edge => ({
         data: {
           ...edge,
+          byproduct_chain: byproductChainEdgeIds.has(edge.id) ? "true" : "false",
           material_state: (() => {
-            const source = nodeMap.get(edge.source)
-            const target = nodeMap.get(edge.target)
+            if (edge.material_state) return edge.material_state
+            const source = vizNodeMap.get(edge.source)
+            const target = vizNodeMap.get(edge.target)
             const sourceGas = source?.type === "fluid" && GAS_FLUID_IDS.has(source?.fluid_id || "")
             const targetGas = target?.type === "fluid" && GAS_FLUID_IDS.has(target?.fluid_id || "")
             if (sourceGas || targetGas) return "gas"
@@ -793,32 +1575,90 @@ export default function App() {
             return "solid"
           })(),
           label: (() => {
-            const source = nodeMap.get(edge.source)
-            const target = nodeMap.get(edge.target)
-            const isFluid = source?.type === "fluid" || target?.type === "fluid"
-            return isFluid ? formatFluidRate(edge.rate_per_s) : formatItemRate(edge.rate_per_s)
+            if (edge.material_label) {
+              const materialState = edge.material_state
+              const isFluid = materialState === "fluid" || materialState === "gas"
+              const baseLabel = isFluid
+                ? formatFluidRate(edge.rate_per_s)
+                : formatItemRate(edge.rate_per_s)
+              const supplyRatio =
+                typeof edge.supply_ratio === "number" && edge.rate_per_s > 0
+                  ? edge.supply_ratio
+                  : null
+              const supplySuffix =
+                supplyRatio !== null && supplyRatio < 0.999
+                  ? ` (supply ${Math.round(supplyRatio * 100)}%)`
+                  : ""
+              return `${edge.material_label}\n${baseLabel}${supplySuffix}`
+            }
+            const source = vizNodeMap.get(edge.source)
+            const target = vizNodeMap.get(edge.target)
+            const isFluid =
+              source?.type === "fluid" || source?.type === "gas" || target?.type === "fluid" || target?.type === "gas"
+            const baseLabel = isFluid
+              ? formatFluidRate(edge.rate_per_s)
+              : formatItemRate(edge.rate_per_s)
+            if (edge.kind !== "consumes") {
+              const supply = supplyByTarget.get(edge.target)
+              if (supply && supply.count > 1 && supply.total > 0) {
+                const percent = Math.max(0, Math.round((edge.rate_per_s / supply.total) * 100))
+                return `${baseLabel} (${percent}%)`
+              }
+              return baseLabel
+            }
+            const demand = demandBySource.get(edge.source)
+            const supply = supplyByTarget.get(edge.source)
+            const demandPercent =
+              demand && demand.count > 1 && demand.total > 0
+                ? Math.max(0, Math.round((edge.rate_per_s / demand.total) * 100))
+                : null
+            const hasSupply = (supplyCountByNode.get(edge.source) ?? 0) > 0
+            const supplyRatio =
+              hasSupply && demand && demand.total > 0
+                ? Math.min(1, Math.max(0, (supply?.total ?? 0) / demand.total))
+                : null
+            const suffixes: string[] = []
+            if (demandPercent !== null) {
+              suffixes.push(`${demandPercent}% demand`)
+            }
+            if (supplyRatio !== null && supplyRatio < 0.999) {
+              suffixes.push(`supply ${Math.round(supplyRatio * 100)}%`)
+            }
+            if (suffixes.length > 0) {
+              return `${baseLabel} (${suffixes.join(", ")})`
+            }
+            return baseLabel
           })(),
           pulse_offset: 0,
           edge_width: (() => {
-            const source = nodeMap.get(edge.source)
-            const target = nodeMap.get(edge.target)
-            const isFluid = source?.type === "fluid" || target?.type === "fluid"
+            const source = vizNodeMap.get(edge.source)
+            const target = vizNodeMap.get(edge.target)
+            const materialState = edge.material_state
+            const isFluid =
+              materialState === "fluid" ||
+              materialState === "gas" ||
+              source?.type === "fluid" ||
+              source?.type === "gas" ||
+              target?.type === "fluid" ||
+              target?.type === "gas"
             const width = getEdgeWidth(edge.rate_per_s, isFluid)
             return showFlowAnimation ? Math.min(width, 3.5) : width
           })(),
           active: activeEdgeIds.has(edge.id) ? "true" : "false",
           bottleneck: (() => {
             if (edge.kind !== "consumes") return "false"
+            if ((supplyCountByNode.get(edge.source) ?? 0) === 0) return "false"
             const flow = nodeFlows.get(edge.source)
             if (!flow) return "false"
             return flow.produced + 1e-6 < flow.consumed ? "true" : "false"
           })(),
           bottleneck_reason: (() => {
             if (edge.kind !== "consumes") return undefined
+            if ((supplyCountByNode.get(edge.source) ?? 0) === 0) return undefined
             const flow = nodeFlows.get(edge.source)
             if (!flow) return undefined
             if (flow.produced + 1e-6 < flow.consumed) {
-              const sourceLabel = nodeMap.get(edge.source)?.label || "upstream"
+              const sourceLabel = vizNodeMap.get(edge.source)?.label || "upstream"
               return `Output capped by ${sourceLabel}`
             }
             return undefined
@@ -827,74 +1667,402 @@ export default function App() {
       }))
     ]
     cy.add(elements)
-    const incoming = new Set(graph.edges.map(edge => edge.target))
-    const rootIds = graph.nodes.filter(node => !incoming.has(node.id)).map(node => node.id)
-    const roots = rootIds.length
-      ? cy.collection(rootIds.map(id => cy.getElementById(id)))
-      : undefined
-    const layout = cy.layout({
-      name: "breadthfirst",
-      directed: true,
-      padding: 60,
-      spacingFactor: 1.2,
+    const mainlineNodes = cy.collection(Array.from(mainlineNodeIds).map(id => cy.getElementById(id)))
+    const mainlineEdges = cy.collection(Array.from(mainlineEdgeIds).map(id => cy.getElementById(id)))
+    const layoutElements = mainlineNodes.union(mainlineEdges)
+    const layout = layoutElements.layout({
+      name: "dagre",
+      rankDir: "LR",
+      ranker: "network-simplex",
+      acyclicer: "greedy",
       nodeDimensionsIncludeLabels: true,
-      roots
+      padding: 60,
+      rankSep: 180,
+      nodeSep: 80,
+      edgeSep: 20
     })
     layout.run()
-    cy.nodes().forEach(node => {
+    let minX = Infinity
+    mainlineNodes.forEach(node => {
       const pos = node.position()
-      node.position({ x: pos.y, y: pos.x })
+      if (pos.x < minX) minX = pos.x
     })
-    const incomingMap = new Map<string, Set<string>>()
-    const outgoingMap = new Map<string, Set<string>>()
-    graph.nodes.forEach(node => {
-      incomingMap.set(node.id, new Set())
-      outgoingMap.set(node.id, new Set())
-    })
-    graph.edges.forEach(edge => {
-      incomingMap.get(edge.target)?.add(edge.source)
-      outgoingMap.get(edge.source)?.add(edge.target)
-    })
-    const indegree = new Map<string, number>()
-    const layer = new Map<string, number>()
-    const queue: string[] = []
-    graph.nodes.forEach(node => {
-      const count = incomingMap.get(node.id)?.size ?? 0
-      indegree.set(node.id, count)
-      layer.set(node.id, 0)
-      if (count === 0) {
-        queue.push(node.id)
-      }
-    })
-    while (queue.length > 0) {
-      const id = queue.shift() as string
-      const base = layer.get(id) ?? 0
-      const neighbors = outgoingMap.get(id)
-      if (!neighbors) continue
-      neighbors.forEach(next => {
-        const nextLayer = Math.max(layer.get(next) ?? 0, base + 1)
-        layer.set(next, nextLayer)
-        const nextIndegree = (indegree.get(next) ?? 0) - 1
-        indegree.set(next, nextIndegree)
-        if (nextIndegree <= 0) {
-          queue.push(next)
-        }
-      })
+    if (!Number.isFinite(minX)) {
+      minX = 0
     }
-    const spacing = 160
-    cy.nodes().forEach(node => {
-      const lvl = layer.get(node.id()) ?? 0
-      const pos = node.position()
-      node.position({ x: lvl * spacing, y: pos.y })
-    })
-    const minX = Math.min(...cy.nodes().map(node => node.position().x))
-    cy.nodes().forEach(node => {
+    mainlineNodes.forEach(node => {
       const pos = node.position()
       node.position({ x: pos.x - minX + 40, y: pos.y })
     })
+    const mainlineSegments: Array<{ x1: number; y1: number; x2: number; y2: number }> = []
+    mainlineEdgeIds.forEach(edgeId => {
+      const edge = cy.getElementById(edgeId)
+      if (edge.empty()) return
+      const source = edge.source()
+      const target = edge.target()
+      if (source.empty() || target.empty()) return
+      const sourcePos = source.position()
+      const targetPos = target.position()
+      mainlineSegments.push({
+        x1: sourcePos.x,
+        y1: sourcePos.y,
+        x2: targetPos.x,
+        y2: targetPos.y
+      })
+    })
+    const occupiedSegments: Array<{ x1: number; y1: number; x2: number; y2: number }> = []
+    const segmentDistance = (a: number, b: number) => Math.abs(a - b)
+    const sharesEndpoint = (
+      a: { x1: number; y1: number; x2: number; y2: number },
+      b: { x1: number; y1: number; x2: number; y2: number }
+    ) => {
+      const eps = 1e-3
+      const points = [
+        [a.x1, a.y1],
+        [a.x2, a.y2]
+      ]
+      const other = [
+        [b.x1, b.y1],
+        [b.x2, b.y2]
+      ]
+      return points.some(
+        ([x, y]) =>
+          other.some(([ox, oy]) => segmentDistance(x, ox) < eps && segmentDistance(y, oy) < eps)
+      )
+    }
+    const orientation = (ax: number, ay: number, bx: number, by: number, cx: number, cy: number) => {
+      const value = (by - ay) * (cx - bx) - (bx - ax) * (cy - by)
+      if (Math.abs(value) < 1e-8) return 0
+      return value > 0 ? 1 : 2
+    }
+    const onSegment = (ax: number, ay: number, bx: number, by: number, cx: number, cy: number) =>
+      Math.min(ax, cx) <= bx + 1e-8 &&
+      bx <= Math.max(ax, cx) + 1e-8 &&
+      Math.min(ay, cy) <= by + 1e-8 &&
+      by <= Math.max(ay, cy) + 1e-8
+    const segmentsIntersect = (
+      a: { x1: number; y1: number; x2: number; y2: number },
+      b: { x1: number; y1: number; x2: number; y2: number }
+    ) => {
+      if (sharesEndpoint(a, b)) return false
+      const o1 = orientation(a.x1, a.y1, a.x2, a.y2, b.x1, b.y1)
+      const o2 = orientation(a.x1, a.y1, a.x2, a.y2, b.x2, b.y2)
+      const o3 = orientation(b.x1, b.y1, b.x2, b.y2, a.x1, a.y1)
+      const o4 = orientation(b.x1, b.y1, b.x2, b.y2, a.x2, a.y2)
+      if (o1 !== o2 && o3 !== o4) return true
+      if (o1 === 0 && onSegment(a.x1, a.y1, b.x1, b.y1, a.x2, a.y2)) return true
+      if (o2 === 0 && onSegment(a.x1, a.y1, b.x2, b.y2, a.x2, a.y2)) return true
+      if (o3 === 0 && onSegment(b.x1, b.y1, a.x1, a.y1, b.x2, b.y2)) return true
+      if (o4 === 0 && onSegment(b.x1, b.y1, a.x2, a.y2, b.x2, b.y2)) return true
+      return false
+    }
+    const anchorsBySource = new Map<string, string[]>()
+    byproductAnchors.forEach(anchorId => {
+      const sourceId = anchorSourceMap.get(anchorId)
+      if (!sourceId) return
+      const list = anchorsBySource.get(sourceId) || []
+      list.push(anchorId)
+      anchorsBySource.set(sourceId, list)
+    })
+    const fixedNodes = new Set(mainlineNodeIds)
+    const verticalSpacing = 90
+    const horizontalSpacing = 160
+    const anchorSpacing = 140
+    const chainOffsetX = 180
+    const chainOffsetY = 80
+    const badgeWidth = 34
+    const badgeHeight = 16
+    const badgeInset = 8
+    const occupiedBounds: Array<{ x1: number; y1: number; x2: number; y2: number }> = []
+    const expandBounds = (
+      bounds: { x1: number; y1: number; x2: number; y2: number },
+      pad: number
+    ) => ({
+      x1: bounds.x1 - pad,
+      y1: bounds.y1 - pad,
+      x2: bounds.x2 + pad,
+      y2: bounds.y2 + pad
+    })
+    const boundsIntersect = (
+      a: { x1: number; y1: number; x2: number; y2: number },
+      b: { x1: number; y1: number; x2: number; y2: number }
+    ) => !(a.x2 < b.x1 || a.x1 > b.x2 || a.y2 < b.y1 || a.y1 > b.y2)
+    const intersectsAny = (
+      bounds: { x1: number; y1: number; x2: number; y2: number }
+    ) => occupiedBounds.some(existing => boundsIntersect(bounds, existing))
+
+    mainlineNodes.forEach(node => {
+      const bounds = node.boundingBox({ includeLabels: true })
+      const nodeData = vizNodeMap.get(node.id())
+      const pad = nodeData && nodeData.type !== "recipe" ? 130 : 48
+      occupiedBounds.push(expandBounds(bounds, pad))
+    })
+
+    anchorsBySource.forEach((anchors, sourceId) => {
+      const sourceNode = cy.getElementById(sourceId)
+      if (sourceNode.empty()) return
+      const sourcePos = sourceNode.position()
+      const leftAnchors = anchors.filter(anchorId => (anchorDirection.get(anchorId) ?? 1) < 0)
+      const rightAnchors = anchors.filter(anchorId => (anchorDirection.get(anchorId) ?? 1) >= 0)
+      const placeGroup = (group: string[], direction: number) => {
+        group.forEach((anchorId, anchorIndex) => {
+          const centeredIndex = anchorIndex - (group.length - 1) / 2
+          const baseX = sourcePos.x + direction * chainOffsetX
+          const baseY =
+            sourcePos.y +
+            (direction < 0 ? -chainOffsetY : chainOffsetY) +
+            centeredIndex * anchorSpacing
+          const nodesForAnchor = Array.from(byproductChainNodeIds).filter(
+            nodeId => anchorForNode.get(nodeId) === anchorId && !fixedNodes.has(nodeId)
+          )
+          if (nodesForAnchor.length === 0) return
+          const nodesForAnchorSet = new Set(nodesForAnchor)
+          const anchorEdges = vizEdges.filter(edge => {
+            if (!byproductChainEdgeIds.has(edge.id)) return false
+            return (
+              nodesForAnchorSet.has(edge.source) ||
+              nodesForAnchorSet.has(edge.target) ||
+              edge.target === anchorId ||
+              edge.source === anchorId
+            )
+          })
+          const nodesByDepth = new Map<number, string[]>()
+          nodesForAnchor.forEach(nodeId => {
+            const depth = chainDepth.get(nodeId) ?? 0
+            const list = nodesByDepth.get(depth) || []
+            list.push(nodeId)
+            nodesByDepth.set(depth, list)
+          })
+          const sortedDepths = Array.from(nodesByDepth.keys()).sort((a, b) => a - b)
+          const placeNodes = (offsetX: number, offsetY: number) => {
+            sortedDepths.forEach(depth => {
+              const row = nodesByDepth.get(depth) || []
+              const rowHeight = (row.length - 1) * verticalSpacing
+              row.forEach((nodeId, index) => {
+                const node = cy.getElementById(nodeId)
+                if (node.empty()) return
+                const offsetYLocal = row.length > 1 ? -rowHeight / 2 + index * verticalSpacing : 0
+                const x = baseX + offsetX + direction * depth * horizontalSpacing
+                const y = baseY + offsetY + offsetYLocal
+                node.position({ x, y })
+              })
+            })
+          }
+          const getAnchorSegments = () =>
+            anchorEdges
+              .map(edge => {
+                const edgeElement = cy.getElementById(edge.id)
+                if (edgeElement.empty()) return null
+                const source = edgeElement.source()
+                const target = edgeElement.target()
+                if (source.empty() || target.empty()) return null
+                const sourcePos = source.position()
+                const targetPos = target.position()
+                return {
+                  x1: sourcePos.x,
+                  y1: sourcePos.y,
+                  x2: targetPos.x,
+                  y2: targetPos.y
+                }
+              })
+              .filter((segment): segment is { x1: number; y1: number; x2: number; y2: number } =>
+                Boolean(segment)
+              )
+          const countCrossings = (segments: Array<{ x1: number; y1: number; x2: number; y2: number }>) => {
+            let crossings = 0
+            segments.forEach(segment => {
+              mainlineSegments.forEach(mainline => {
+                if (segmentsIntersect(segment, mainline)) crossings += 1
+              })
+              occupiedSegments.forEach(existing => {
+                if (segmentsIntersect(segment, existing)) crossings += 1
+              })
+            })
+            return crossings
+          }
+          const chainNodes = nodesForAnchor
+            .map(nodeId => cy.getElementById(nodeId))
+            .filter(node => !node.empty())
+          const chainCollection = cy.collection(chainNodes)
+          const candidates = [
+            { x: 0, y: 0 },
+            { x: 0, y: anchorSpacing },
+            { x: 0, y: -anchorSpacing },
+            { x: direction * horizontalSpacing * 2, y: 0 },
+            { x: direction * horizontalSpacing * 2, y: anchorSpacing },
+            { x: direction * horizontalSpacing * 2, y: -anchorSpacing },
+            { x: direction * horizontalSpacing * 4, y: 0 }
+          ]
+          let bestCandidate = candidates[0]
+          let bestCrossings = Number.POSITIVE_INFINITY
+          let bestOverlap = true
+          candidates.forEach(candidate => {
+            placeNodes(candidate.x, candidate.y)
+            const bounds = chainCollection.boundingBox({ includeLabels: true })
+            const padded = expandBounds(bounds, 30)
+            const overlap = intersectsAny(padded)
+            const segments = getAnchorSegments()
+            const crossings = countCrossings(segments)
+            if (
+              (bestOverlap && !overlap) ||
+              (overlap === bestOverlap && crossings < bestCrossings)
+            ) {
+              bestCandidate = candidate
+              bestCrossings = crossings
+              bestOverlap = overlap
+            }
+          })
+          placeNodes(bestCandidate.x, bestCandidate.y)
+          const finalBounds = chainCollection.boundingBox({ includeLabels: true })
+          occupiedBounds.push(expandBounds(finalBounds, 30))
+          getAnchorSegments().forEach(segment => occupiedSegments.push(segment))
+        })
+      }
+      placeGroup(leftAnchors, -1)
+      placeGroup(rightAnchors, 1)
+    })
+    const leafDistance = 210
+    const boundsByNode = new Map<string, { x1: number; y1: number; x2: number; y2: number }>()
+    vizNodes.forEach(node => {
+      const element = cy.getElementById(node.id)
+      if (element.empty()) return
+      const pad = node.type === "recipe" ? 24 : 80
+      boundsByNode.set(node.id, expandBounds(element.boundingBox({ includeLabels: true }), pad))
+    })
+    const intersectsOthers = (
+      bounds: { x1: number; y1: number; x2: number; y2: number },
+      nodeId: string
+    ) => {
+      for (const [otherId, otherBounds] of boundsByNode.entries()) {
+        if (otherId === nodeId) continue
+        if (boundsIntersect(bounds, otherBounds)) return true
+      }
+      return false
+    }
+    const adjustLeafNode = (nodeId: string) => {
+      const element = cy.getElementById(nodeId)
+      if (element.empty()) return
+      const neighbors = vizEdges.filter(
+        edge => edge.source === nodeId || edge.target === nodeId
+      )
+      if (neighbors.length !== 1) return
+      const edge = neighbors[0]
+      const neighborId = edge.source === nodeId ? edge.target : edge.source
+      const neighborNode = vizNodeMap.get(neighborId)
+      if (!neighborNode || neighborNode.type !== "recipe") return
+      const neighborElement = cy.getElementById(neighborId)
+      if (neighborElement.empty()) return
+      const pos = element.position()
+      const neighborPos = neighborElement.position()
+      let dx = pos.x - neighborPos.x
+      let dy = pos.y - neighborPos.y
+      const length = Math.hypot(dx, dy) || 1
+      dx /= length
+      dy /= length
+      const candidate = { x: neighborPos.x + dx * leafDistance, y: neighborPos.y + dy * leafDistance }
+      element.position(candidate)
+      let bounds = expandBounds(element.boundingBox({ includeLabels: true }), 80)
+      if (intersectsOthers(bounds, nodeId)) {
+        const perp = { x: -dy, y: dx }
+        const nudge = 180
+        const candidateA = {
+          x: neighborPos.x + dx * leafDistance + perp.x * nudge,
+          y: neighborPos.y + dy * leafDistance + perp.y * nudge
+        }
+        element.position(candidateA)
+        bounds = expandBounds(element.boundingBox({ includeLabels: true }), 80)
+        if (intersectsOthers(bounds, nodeId)) {
+          const candidateB = {
+            x: neighborPos.x + dx * leafDistance - perp.x * nudge,
+            y: neighborPos.y + dy * leafDistance - perp.y * nudge
+          }
+          element.position(candidateB)
+          bounds = expandBounds(element.boundingBox({ includeLabels: true }), 80)
+          if (intersectsOthers(bounds, nodeId)) {
+            element.position(pos)
+            return
+          }
+        }
+      }
+      boundsByNode.set(nodeId, bounds)
+    }
+    vizNodes.forEach(node => {
+      if (node.type === "recipe") return
+      adjustLeafNode(node.id)
+    })
+    const positionBadgeFor = (targetId: string) => {
+      const badge = cy.getElementById(`badge:${targetId}`)
+      if (badge.empty()) return
+      const target = cy.getElementById(targetId)
+      if (target.empty()) return
+      const pos = target.position()
+      const width = target.width()
+      const height = target.height()
+      if (![pos.x, pos.y, width, height].every(Number.isFinite)) return
+      badge.unlock()
+      badge.position({
+        x: pos.x + width / 2 - badgeWidth / 2 - badgeInset,
+        y: pos.y - height / 2 + badgeHeight / 2 + badgeInset
+      })
+      badge.lock()
+    }
+    const positionBadges = () => {
+      const badgeElements = cy.nodes(".machine-badge")
+      if (badgeElements.empty()) return
+      badgeElements.forEach(badge => {
+        const targetId = badge.data("badge_for") as string | undefined
+        if (!targetId) return
+        positionBadgeFor(targetId)
+      })
+    }
+    positionBadges()
+    mainlineEdgeIds.forEach(edgeId => {
+      const edge = cy.getElementById(edgeId)
+      if (edge.empty()) return
+      const source = edge.source()
+      const target = edge.target()
+      if (source.empty() || target.empty()) return
+      const isBackEdge = source.position().x - target.position().x > 20
+      edge.data("back_edge", isBackEdge ? "true" : "false")
+    })
     cy.fit(undefined, 30)
+    cy.off("position", "node[type = \"recipe\"]")
+    cy.on("position", "node[type = \"recipe\"]", event => {
+      const nodeId = event.target.id()
+      if (!nodeId) return
+      positionBadgeFor(nodeId)
+    })
+    cy.off("dragfree", "node[type = \"recipe\"]")
+    cy.on("dragfree", "node[type = \"recipe\"]", event => {
+      const nodeId = event.target.id()
+      if (!nodeId) return
+      positionBadgeFor(nodeId)
+    })
+    requestAnimationFrame(() => {
+      if (!cyRef.current) return
+      positionBadges()
+    })
     setHoverInfo(null)
-  }, [graph, recipeTierOverrides, selectedRecipe, rateUnit, outputKey, inputTargets, showFlowAnimation])
+  }, [
+    graph,
+    recipeTierOverrides,
+    selectedRecipe,
+    rateUnit,
+    rateMode,
+    outputKey,
+    inputTargets,
+    showFlowAnimation,
+    showSecondaryOutputs
+  ])
+
+  const byproductRecipeNodeIds = useMemo(() => {
+    if (!graph) return new Set<string>()
+    return new Set(
+      graph.nodes
+        .filter(node => Boolean(node.byproduct_input_key))
+        .map(node => node.id)
+    )
+  }, [graph])
 
   useEffect(() => {
     if (!cyRef.current) return
@@ -925,6 +2093,11 @@ export default function App() {
         `Effective duration: ${effectiveSeconds ? effectiveSeconds.toFixed(2) : "?"}s`,
         `EU/t: ${data.eut ?? "?"}`
       ]
+      if (rateMode === "machines") {
+        const utilization =
+          typeof data.utilization === "number" ? data.utilization : null
+        lines.push(`Utilization: ${utilization === null ? "--" : formatUtilization(utilization)}`)
+      }
       showTooltip(event, lines)
     })
     cy.on("mouseout", "node[type = \"recipe\"]", clearTooltip)
@@ -946,16 +2119,29 @@ export default function App() {
     cy.on("tap", "node", event => {
       clearSelection()
       setRadialMenu(null)
-      const node = event.target
+      const tapped = event.target
+      const tappedData = tapped.data()
+      const node =
+        tappedData?.type === "badge" && tappedData.badge_for
+          ? cy.getElementById(tappedData.badge_for)
+          : tapped
+      if (node.empty()) return
       node.addClass("selected")
       const upstream = node.predecessors()
       const downstream = node.successors()
       const keep = upstream.union(downstream).union(node)
-      const dim = cy.elements().difference(keep)
+      const keepNodes = keep.nodes()
+      const keepBadges = cy.nodes(".machine-badge").filter(badge => {
+        const targetId = badge.data("badge_for")
+        if (!targetId) return false
+        return keepNodes.some(entry => entry.id() === targetId)
+      })
+      const keepWithBadges = keep.union(keepBadges)
+      const dim = cy.elements().difference(keepWithBadges)
       dim.addClass("dimmed")
       upstream.addClass("upstream")
       downstream.addClass("downstream")
-      keep.addClass("path")
+      keepWithBadges.addClass("path")
     })
     cy.on("cxttap", "node", event => {
       const node = event.target
@@ -970,15 +2156,34 @@ export default function App() {
       if (!data) return
       const rect = containerRef.current?.getBoundingClientRect()
       const fallbackPos = event.renderedPosition || event.position
-      const x = rect && originalEvent ? originalEvent.clientX - rect.left : fallbackPos.x
-      const y = rect && originalEvent ? originalEvent.clientY - rect.top : fallbackPos.y
+      let x = rect && originalEvent ? originalEvent.clientX - rect.left : fallbackPos.x
+      let y = rect && originalEvent ? originalEvent.clientY - rect.top : fallbackPos.y
+      if (rect) {
+        x = clampMenuPosition(x, rect.width, RADIAL_MENU_MARGIN)
+        y = clampMenuPosition(y, rect.height, RADIAL_MENU_MARGIN)
+      }
       if (data.type === "recipe" && data.rid) {
+        const outputKeyValue =
+          typeof data.output_key === "string"
+            ? data.output_key
+            : typeof data.outputKey === "string"
+              ? data.outputKey
+              : typeof data.id === "string" &&
+                  typeof data.rid === "string" &&
+                  data.id.startsWith(`recipe:${data.rid}:`)
+                ? data.id.slice(`recipe:${data.rid}:`.length)
+                : undefined
         setRadialMenu({
           kind: "recipe",
           x,
           y,
           rid: data.rid,
-          minTier: data.min_tier
+          minTier: data.min_tier,
+          outputKey: outputKeyValue,
+          machinesRequired: data.machines_required,
+          machinesDemand: data.machines_demand,
+          targetRatePerS: data.target_rate_per_s ?? null,
+          isByproductChain: Boolean(data.byproduct_input_key)
         })
         return
       }
@@ -986,6 +2191,14 @@ export default function App() {
       const target = getTargetForNode(data)
       if (!target) return
       const key = getTargetKey(target)
+      const hasByproductSupply = !!graph?.edges.some(edge => {
+        if (edge.target !== node.id()) return false
+        if (edge.kind === "byproduct") return true
+        if (edge.kind === "produces") {
+          return byproductRecipeNodeIds.has(edge.source)
+        }
+        return false
+      })
       if (outputKey && key === outputKey) {
         setRadialMenu({
           kind: "target",
@@ -993,7 +2206,8 @@ export default function App() {
           y,
           target,
           isOutput: true,
-          ratePerS: null
+          ratePerS: null,
+          hasByproductSupply
         })
       } else {
         const rate = getInputRateForNodeId(node.id())
@@ -1003,7 +2217,8 @@ export default function App() {
           y,
           target,
           isOutput: false,
-          ratePerS: rate
+          ratePerS: rate,
+          hasByproductSupply
         })
       }
     })
@@ -1011,7 +2226,7 @@ export default function App() {
     return () => {
       cy.removeAllListeners()
     }
-  }, [graph, outputKey])
+  }, [graph, outputKey, rateMode, byproductRecipeNodeIds])
 
   useEffect(() => {
     if (!cyRef.current || !graph) return
@@ -1071,11 +2286,39 @@ export default function App() {
         rid: node.rid,
         label: node.label,
         machines: node.machines_required,
+        machinesDemand: node.machines_demand,
+        outputKey: node.output_key,
+        minTier: node.min_tier,
+        utilization: rateMode === "machines" ? utilizationByRecipeId.get(node.id) ?? null : null,
         duration_ticks: node.duration_ticks,
         eut: node.eut,
         overclock_tiers: node.overclock_tiers
       }))
-  }, [graph])
+  }, [graph, rateMode, utilizationByRecipeId])
+
+  const outputRatePerS = useMemo(() => {
+    if (rateMode === "output") {
+      const safeValue = clampWholeNumber(rateValue, 1)
+      const ratePerS = getRatePerS(safeValue)
+      return Number.isFinite(ratePerS) ? ratePerS : null
+    }
+    if (graph && outputKey && selectedRecipe) {
+      const outputNodeId = getRecipeNodeId(selectedRecipe.rid, outputKey)
+      const node = graph.nodes.find(candidate => candidate.id === outputNodeId)
+      return node?.target_rate_per_s ?? null
+    }
+    return getOutputRateFromMachines()
+  }, [
+    graph,
+    outputKey,
+    selectedRecipe,
+    outputTarget,
+    outputMachineCount,
+    recipeOverclockTiers,
+    rateMode,
+    rateValue,
+    rateUnit
+  ])
 
   const totalEnergyPerTick = useMemo(() => {
     if (!graph) return null
@@ -1089,11 +2332,22 @@ export default function App() {
   const restoreConfig = (entry: SavedConfigEntry) => {
     const cfg = entry.config
     isRestoringConfigRef.current = true
+    const savedOverrides = cfg.machineCountOverrides ?? {}
     setOutputTarget(cfg.outputTarget)
     setSelectedRecipe(cfg.selectedRecipe)
     setInputTargets(cfg.inputTargets)
-    setRateValue(cfg.rateValue)
-    setRateUnit(cfg.rateUnit)
+    setByproductTargets(cfg.byproductTargets ?? [])
+    setOutputMachineCount(cfg.outputMachineCount ?? 1)
+    setRateMode(cfg.rateMode ?? "machines")
+    setRateValue(cfg.rateValue ?? 1)
+    setMachineCountOverrides(savedOverrides)
+    setManualMachineCounts(
+      Object.keys(savedOverrides).reduce<Record<string, boolean>>((acc, key) => {
+        acc[key] = true
+        return acc
+      }, {})
+    )
+    setRateUnit(cfg.rateUnit ?? "min")
     setUserVoltageTier(cfg.userVoltageTier)
     setMaxCoilType(cfg.maxCoilType)
     setRecipeTierOverrides(cfg.recipeTierOverrides)
@@ -1106,9 +2360,9 @@ export default function App() {
     setOutputRecipes([])
     setMachinesForOutput([])
     setSelectionMode("output")
+    setPendingByproductInput(null)
     setConfigTab("outputs")
     setGraphTab("graph")
-    lastTargetRatePerSRef.current = getRatePerS(cfg.rateValue, cfg.rateUnit)
     setGraph(null)
     setError(null)
     window.setTimeout(() => {
@@ -1128,7 +2382,11 @@ export default function App() {
       outputTarget,
       selectedRecipe,
       inputTargets,
+      byproductTargets,
+      outputMachineCount,
+      rateMode,
       rateValue,
+      machineCountOverrides,
       rateUnit,
       userVoltageTier,
       maxCoilType,
@@ -1148,120 +2406,318 @@ export default function App() {
     setSavedConfigs(prev => prev.filter(entry => entry.id !== id))
   }
 
-  const buildSvgWithFooter = () => {
-    if (!cyRef.current) return null
-    const rawSvg = cyRef.current.svg({
-      full: true,
-      scale: 1,
-      bg: "#161311"
-    })
-    const parser = new DOMParser()
-    const doc = parser.parseFromString(rawSvg, "image/svg+xml")
-    const svg = doc.documentElement as SVGSVGElement
-    const parseSize = (value: string | null) => (value ? Number.parseFloat(value) : 0)
-    let width = parseSize(svg.getAttribute("width"))
-    let height = parseSize(svg.getAttribute("height"))
-    const viewBox = svg.getAttribute("viewBox")
-    let viewBoxParts: number[] | null = null
-    if (viewBox) {
-      const parts = viewBox.split(/\s+/).map(part => Number.parseFloat(part))
-      if (parts.length === 4 && parts.every(Number.isFinite)) {
-        viewBoxParts = parts
-        width = width || parts[2]
-        height = height || parts[3]
-      }
+  const ensureCanvas2SvgTextPatch = () => {
+    const c2s = (window as any).C2S
+    if (!c2s || c2s.__gtnhTextPatch) return
+    const proto = c2s.prototype
+    if (!proto || typeof proto.__applyText !== "function") return
+    const originalApplyText = proto.__applyText
+    proto.__applyText = function (text: string, x: number, y: number, type: string) {
+      const prevElement = this.__currentElement
+      const prevPath = this.__currentDefaultPath
+      const prevPosition = this.__currentPosition
+        ? { ...this.__currentPosition }
+        : this.__currentPosition
+      originalApplyText.call(this, text, x, y, type)
+      this.__currentElement = prevElement
+      this.__currentDefaultPath = prevPath
+      this.__currentPosition = prevPosition
     }
-    if (!width || !height) {
-      width = width || cyRef.current.width()
-      height = height || cyRef.current.height()
-    }
-    const footerHeight = 56
-    const nextHeight = height + footerHeight
-    svg.setAttribute("width", `${width}`)
-    svg.setAttribute("height", `${nextHeight}`)
-    if (viewBoxParts) {
-      const [minX, minY, vbWidth, vbHeight] = viewBoxParts
-      svg.setAttribute("viewBox", `${minX} ${minY} ${vbWidth} ${vbHeight + footerHeight}`)
-    } else {
-      svg.setAttribute("viewBox", `0 0 ${width} ${nextHeight}`)
-    }
-
-    const footer = getFooterSegments()
-    const ns = "http://www.w3.org/2000/svg"
-    const footerGroup = doc.createElementNS(ns, "g")
-    footerGroup.setAttribute("data-role", "footer")
-    footerGroup.setAttribute("transform", `translate(0 ${height})`)
-
-    const footerRect = doc.createElementNS(ns, "rect")
-    footerRect.setAttribute("x", "0")
-    footerRect.setAttribute("y", "0")
-    footerRect.setAttribute("width", `${width}`)
-    footerRect.setAttribute("height", `${footerHeight}`)
-    footerRect.setAttribute("fill", "#211b16")
-    footerGroup.appendChild(footerRect)
-
-    const makeFooterText = (value: string, x: number, anchor: "start" | "middle" | "end", color: string) => {
-      const text = doc.createElementNS(ns, "text")
-      text.textContent = value
-      text.setAttribute("x", `${x}`)
-      text.setAttribute("y", `${footerHeight / 2}`)
-      text.setAttribute("fill", color)
-      text.setAttribute("font-family", "'Space Grotesk', sans-serif")
-      text.setAttribute("font-size", "14")
-      text.setAttribute("font-weight", "600")
-      text.setAttribute("dominant-baseline", "middle")
-      text.setAttribute("text-anchor", anchor)
-      footerGroup.appendChild(text)
-    }
-
-    makeFooterText(footer.left, 18, "start", "#f4efe6")
-    makeFooterText(footer.middle, width / 2, "middle", "#bcae9a")
-    makeFooterText(footer.right, width - 18, "end", "#bcae9a")
-    svg.appendChild(footerGroup)
-
-    const svgText = new XMLSerializer().serializeToString(svg)
-    return { svgText, width, height: nextHeight }
+    c2s.__gtnhTextPatch = true
   }
 
-  const renderGraphWithFooter = async () => {
+  const addSvgPaddingNodes = (cy: cytoscape.Core, padding: number) => {
+    const elements = cy.elements()
+    if (elements.length === 0 || padding <= 0) return () => undefined
+    const bbox = elements.boundingBox({ includeLabels: true, includeOverlays: true })
+    if (
+      !Number.isFinite(bbox.x1) ||
+      !Number.isFinite(bbox.y1) ||
+      !Number.isFinite(bbox.x2) ||
+      !Number.isFinite(bbox.y2)
+    ) {
+      return () => undefined
+    }
+    const idBase = `export-padding-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+    const nodes = cy.add([
+      {
+        group: "nodes",
+        data: { id: `${idBase}-tl`, export_padding: "true" },
+        position: { x: bbox.x1 - padding, y: bbox.y1 - padding }
+      },
+      {
+        group: "nodes",
+        data: { id: `${idBase}-br`, export_padding: "true" },
+        position: { x: bbox.x2 + padding, y: bbox.y2 + padding }
+      }
+    ])
+    return () => {
+      cy.remove(nodes)
+    }
+  }
+
+  const buildSvgPayload = () => {
+    if (!cyRef.current) return null
+    ensureCanvas2SvgTextPatch()
+    const sourceCy = cyRef.current
+    const baseStyle = sourceCy.style().json()
+    const exportStyle = [...baseStyle, ...EXPORT_STYLE_OVERRIDES]
+    const sourceElements = sourceCy.elements()
+    const sourceBounds = sourceElements.boundingBox({ includeLabels: true, includeOverlays: true })
+    if (
+      !Number.isFinite(sourceBounds.x1) ||
+      !Number.isFinite(sourceBounds.y1) ||
+      !Number.isFinite(sourceBounds.x2) ||
+      !Number.isFinite(sourceBounds.y2)
+    ) {
+      return null
+    }
+    const width = Math.max(1, Math.ceil(sourceBounds.w + SVG_EXPORT_PADDING * 2))
+    const height = Math.max(1, Math.ceil(sourceBounds.h + SVG_EXPORT_PADDING * 2))
+    const dx = SVG_EXPORT_PADDING - sourceBounds.x1
+    const dy = SVG_EXPORT_PADDING - sourceBounds.y1
+    const normalizeEdgeWidth = (value: unknown) => {
+      const width = typeof value === "number" && Number.isFinite(value) ? value : 2
+      return Math.max(1, Math.min(EXPORT_MAX_EDGE_WIDTH, width * EXPORT_EDGE_WIDTH_SCALE))
+    }
+    const preserveNodeIds = new Set<string>()
+    if (outputKey) {
+      preserveNodeIds.add(outputKey)
+    }
+    inputTargets.forEach(entry => preserveNodeIds.add(entry.key))
+    byproductTargets.forEach(entry => {
+      preserveNodeIds.add(getTargetKey(entry.input))
+      preserveNodeIds.add(getTargetKey(entry.output))
+    })
+    const simplifySvgElements = (elements: cytoscape.ElementDefinition[]) => {
+      const nodes = elements.filter(element => element.group === "nodes")
+      const edges = elements.filter(element => element.group === "edges")
+      const nodeById = new Map<string, cytoscape.ElementDefinition>()
+      nodes.forEach(node => {
+        const nodeId = (node.data as any)?.id as string | undefined
+        if (nodeId) {
+          nodeById.set(nodeId, node)
+        }
+      })
+      const incoming = new Map<string, cytoscape.ElementDefinition[]>()
+      const outgoing = new Map<string, cytoscape.ElementDefinition[]>()
+      edges.forEach(edge => {
+        const data = edge.data as any
+        if (!data) return
+        const source = data.source as string | undefined
+        const target = data.target as string | undefined
+        if (!source || !target) return
+        const outList = outgoing.get(source) || []
+        outList.push(edge)
+        outgoing.set(source, outList)
+        const inList = incoming.get(target) || []
+        inList.push(edge)
+        incoming.set(target, inList)
+      })
+      const removedNodeIds = new Set<string>()
+      const removedEdgeIds = new Set<string>()
+      const addedEdges: cytoscape.ElementDefinition[] = []
+      const getEdgeData = (edge: cytoscape.ElementDefinition) => edge.data as any
+      nodes.forEach(node => {
+        const data = node.data as any
+        if (!data) return
+        const nodeId = data.id as string | undefined
+        if (!nodeId) return
+        if (preserveNodeIds.has(nodeId)) return
+        const nodeType = data.type as string | undefined
+        if (!nodeType || !["item", "fluid", "gas"].includes(nodeType)) return
+        const inEdges = incoming.get(nodeId) || []
+        const outEdges = outgoing.get(nodeId) || []
+        if (inEdges.length !== 1 || outEdges.length !== 1) return
+        const inEdge = inEdges[0]
+        const outEdge = outEdges[0]
+        const inData = getEdgeData(inEdge)
+        const outData = getEdgeData(outEdge)
+        const sourceId = inData?.source as string | undefined
+        const targetId = outData?.target as string | undefined
+        if (!sourceId || !targetId || sourceId === targetId) return
+        const sourceNode = nodeById.get(sourceId)
+        const targetNode = nodeById.get(targetId)
+        if (!sourceNode || !targetNode) return
+        const sourceType = (sourceNode.data as any)?.type
+        const targetType = (targetNode.data as any)?.type
+        if (sourceType !== "recipe" || targetType !== "recipe") return
+        const rate = typeof outData?.rate_per_s === "number" ? outData.rate_per_s : inData?.rate_per_s
+        const isFluid = nodeType === "fluid" || nodeType === "gas"
+        const materialName = data.label || data.item_id || data.fluid_id || "Material"
+        const rateLabel =
+          typeof rate === "number"
+            ? isFluid
+              ? formatFluidRate(rate)
+              : formatItemRate(rate)
+            : null
+        const label = rateLabel ? `${materialName}\n${rateLabel}` : materialName
+        const edgeWidth = Math.max(
+          Number(inData?.edge_width ?? 2),
+          Number(outData?.edge_width ?? 2)
+        )
+        const kind =
+          inData?.kind === "byproduct" || outData?.kind === "byproduct" ? "byproduct" : "flow"
+        const materialState = nodeType === "gas" ? "gas" : isFluid ? "fluid" : "solid"
+        addedEdges.push({
+          group: "edges",
+          data: {
+            id: `flow:${nodeId}`,
+            source: sourceId,
+            target: targetId,
+            kind,
+            material_state: materialState,
+            label,
+            rate_per_s: rate,
+            edge_width: edgeWidth,
+            active: inData?.active ?? outData?.active ?? "true"
+          }
+        })
+        removedNodeIds.add(nodeId)
+        if (inData?.id) removedEdgeIds.add(inData.id)
+        if (outData?.id) removedEdgeIds.add(outData.id)
+      })
+      const nextNodes = nodes.filter(node => {
+        const nodeId = (node.data as any)?.id as string | undefined
+        return !nodeId || !removedNodeIds.has(nodeId)
+      })
+      const nextEdges = edges.filter(edge => {
+        const edgeId = (edge.data as any)?.id as string | undefined
+        return !edgeId || !removedEdgeIds.has(edgeId)
+      })
+      return [...nextNodes, ...nextEdges, ...addedEdges]
+    }
+    const elements = simplifySvgElements(
+      sourceElements.jsons().map(element => {
+      if (element.group === "edges") {
+        return {
+          ...element,
+          data: {
+            ...(element.data || {}),
+            edge_width: normalizeEdgeWidth(element.data?.edge_width)
+          }
+        }
+      }
+      if (element.group !== "nodes") return element
+      const position = element.position
+      if (
+        position &&
+        Number.isFinite(position.x) &&
+        Number.isFinite(position.y)
+      ) {
+        return {
+          ...element,
+          position: { x: position.x + dx, y: position.y + dy }
+        }
+      }
+      return {
+        ...element,
+        position: { x: dx, y: dy }
+      }
+    })
+    )
+    const container = document.createElement("div")
+    container.style.position = "fixed"
+    container.style.left = "-10000px"
+    container.style.top = "-10000px"
+    container.style.width = `${width}px`
+    container.style.height = `${height}px`
+    container.style.pointerEvents = "none"
+    document.body.appendChild(container)
+    const cy = cytoscape({
+      container,
+      elements,
+      style: exportStyle,
+      layout: { name: "preset" },
+      zoom: 1,
+      pan: { x: 0, y: 0 },
+      userZoomingEnabled: false,
+      userPanningEnabled: false
+    })
+    try {
+      cy.resize()
+      const rawSvg = cy.svg({
+        full: true,
+        scale: SVG_EXPORT_SCALE,
+        bg: "#161311"
+      })
+      const parser = new DOMParser()
+      const doc = parser.parseFromString(rawSvg, "image/svg+xml")
+      const svg = doc.documentElement as SVGSVGElement
+      const scaledWidth = width * SVG_EXPORT_SCALE
+      const scaledHeight = height * SVG_EXPORT_SCALE
+      svg.setAttribute("shape-rendering", "geometricPrecision")
+      svg.setAttribute("width", `${width}`)
+      svg.setAttribute("height", `${height}`)
+      svg.setAttribute("viewBox", `0 0 ${scaledWidth} ${scaledHeight}`)
+      svg.querySelectorAll("path, polyline, polygon, line").forEach(path => {
+        path.setAttribute("stroke-linejoin", "round")
+        path.setAttribute("stroke-linecap", "round")
+        path.setAttribute("stroke-miterlimit", String(SVG_EXPORT_MITER_LIMIT))
+      })
+      const svgText = new XMLSerializer().serializeToString(svg)
+      return { svgText, width, height }
+    } finally {
+      cy.destroy()
+      container.remove()
+    }
+  }
+
+  const renderGraphCanvas = async ({
+    padding = 0,
+    scale = 2
+  }: { padding?: number; scale?: number } = {}) => {
     if (!cyRef.current) return null
     const pngData = cyRef.current.png({
       full: true,
-      scale: 2,
+      scale,
       bg: "#161311"
     })
     const image = new Image()
-    const footerHeight = 56
-    const footer = getFooterSegments()
     return new Promise<HTMLCanvasElement>((resolve, reject) => {
       image.onload = () => {
         const canvas = document.createElement("canvas")
-        canvas.width = image.width
-        canvas.height = image.height + footerHeight
+        canvas.width = image.width + padding * 2
+        canvas.height = image.height + padding * 2
         const ctx = canvas.getContext("2d")
         if (!ctx) {
           reject(new Error("Canvas not supported"))
           return
         }
-        ctx.drawImage(image, 0, 0)
-        ctx.fillStyle = "#211b16"
-        ctx.fillRect(0, image.height, canvas.width, footerHeight)
-        ctx.fillStyle = "#bcae9a"
-        ctx.font = "600 14px 'Space Grotesk', sans-serif"
-        ctx.textBaseline = "middle"
-        ctx.fillStyle = "#f4efe6"
-        ctx.textAlign = "left"
-        ctx.fillText(footer.left, 18, image.height + footerHeight / 2)
-        ctx.fillStyle = "#bcae9a"
-        ctx.textAlign = "center"
-        ctx.fillText(footer.middle, canvas.width / 2, image.height + footerHeight / 2)
-        ctx.textAlign = "right"
-        ctx.fillText(footer.right, canvas.width - 18, image.height + footerHeight / 2)
+        ctx.fillStyle = "#161311"
+        ctx.fillRect(0, 0, canvas.width, canvas.height)
+        ctx.drawImage(image, padding, padding)
         resolve(canvas)
       }
       image.onerror = () => reject(new Error("Failed to render image"))
       image.src = pngData
     })
+  }
+
+  const renderGraphWithFooter = async () => {
+    const canvas = await renderGraphCanvas()
+    if (!canvas) return null
+    const footerHeight = 56
+    const footer = getFooterSegments()
+    const next = document.createElement("canvas")
+    next.width = canvas.width
+    next.height = canvas.height + footerHeight
+    const nextCtx = next.getContext("2d")
+    if (!nextCtx) throw new Error("Canvas not supported")
+    nextCtx.drawImage(canvas, 0, 0)
+    nextCtx.fillStyle = "#211b16"
+    nextCtx.fillRect(0, canvas.height, next.width, footerHeight)
+    nextCtx.font = "600 14px 'Space Grotesk', sans-serif"
+    nextCtx.textBaseline = "middle"
+    nextCtx.fillStyle = "#f4efe6"
+    nextCtx.textAlign = "left"
+    nextCtx.fillText(footer.left, 18, canvas.height + footerHeight / 2)
+    nextCtx.fillStyle = "#bcae9a"
+    nextCtx.textAlign = "center"
+    nextCtx.fillText(footer.middle, next.width / 2, canvas.height + footerHeight / 2)
+    nextCtx.textAlign = "right"
+    nextCtx.fillText(footer.right, next.width - 18, canvas.height + footerHeight / 2)
+    return next
   }
 
   const downloadBlob = (blob: Blob, filename: string) => {
@@ -1292,7 +2748,7 @@ export default function App() {
 
   const downloadSvg = async () => {
     try {
-      const svgPayload = buildSvgWithFooter()
+      const svgPayload = buildSvgPayload()
       if (!svgPayload) return
       const blob = new Blob([svgPayload.svgText], { type: "image/svg+xml" })
       downloadBlob(blob, "gtnh-graph.svg")
@@ -1303,7 +2759,7 @@ export default function App() {
 
   const downloadPdf = async () => {
     try {
-      const svgPayload = buildSvgWithFooter()
+      const svgPayload = buildSvgPayload()
       if (!svgPayload) return
       const wrapper = document.createElement("div")
       wrapper.style.position = "fixed"
@@ -1317,15 +2773,15 @@ export default function App() {
         throw new Error("SVG export failed")
       }
       document.body.appendChild(wrapper)
+      const pdf = new jsPDF({
+        unit: "pt",
+        format: [svgPayload.width * PX_TO_PT, svgPayload.height * PX_TO_PT]
+      })
       try {
-        const pdf = new jsPDF({
-          unit: "pt",
-          format: [svgPayload.width, svgPayload.height]
-        })
         await svg2pdf(svgElement, pdf, {
           xOffset: 0,
           yOffset: 0,
-          scale: 1
+          scale: PX_TO_PT
         })
         const pdfBlob = pdf.output("blob")
         downloadBlob(pdfBlob, "gtnh-graph.pdf")
@@ -1352,6 +2808,70 @@ export default function App() {
     )
   }, [outputRecipes])
 
+  const recipeProducesTarget = (recipe: RecipeOption, target: Target | null) => {
+    if (!target) return false
+    if (target.type === "item") {
+      return (recipe.item_outputs ?? []).some(
+        item => item.item_id === target.id && item.meta === target.meta
+      )
+    }
+    return (recipe.fluid_outputs ?? []).some(fluid => fluid.fluid_id === target.id)
+  }
+
+  const byproductRecipeIds = useMemo(() => {
+    return new Set(byproductRecipes.map(recipe => recipe.rid))
+  }, [byproductRecipes])
+
+  const byproductOutputSuggestions = useMemo(() => {
+    const outputs = new Map<string, Target>()
+    for (const recipe of byproductRecipes) {
+      for (const item of recipe.item_outputs ?? []) {
+        const target: Target = {
+          type: "item",
+          id: item.item_id,
+          meta: item.meta,
+          name: item.name || item.item_id
+        }
+        const key = getTargetKey(target)
+        if (!outputs.has(key)) {
+          outputs.set(key, target)
+        }
+      }
+      for (const fluid of recipe.fluid_outputs ?? []) {
+        const target: Target = {
+          type: "fluid",
+          id: fluid.fluid_id,
+          meta: 0,
+          name: fluid.name || fluid.fluid_id
+        }
+        const key = getTargetKey(target)
+        if (!outputs.has(key)) {
+          outputs.set(key, target)
+        }
+      }
+    }
+    return Array.from(outputs.values())
+  }, [byproductRecipes])
+
+  const byproductRecipesForSelectedOutput = useMemo(() => {
+    if (selectionMode !== "byproduct" || !selectedOutput) return []
+    return byproductRecipes.filter(recipe => recipeProducesTarget(recipe, selectedOutput))
+  }, [byproductRecipes, selectionMode, selectedOutput])
+
+  const byproductMachineIdsForSelectedOutput = useMemo(() => {
+    const machineIds = new Set<string>()
+    for (const recipe of byproductRecipesForSelectedOutput) {
+      machineIds.add(recipe.machine_id)
+    }
+    return machineIds
+  }, [byproductRecipesForSelectedOutput])
+
+  const machinesForSelection = useMemo(() => {
+    if (selectionMode !== "byproduct") return machinesForOutput
+    if (!selectedOutput) return []
+    return machinesForOutput.filter(machine => byproductMachineIdsForSelectedOutput.has(machine.machine_id))
+  }, [machinesForOutput, byproductMachineIdsForSelectedOutput, selectionMode, selectedOutput])
+
   useEffect(() => {
     if (outputTarget) return
     setSelectedOutput(null)
@@ -1359,7 +2879,15 @@ export default function App() {
     setOutputRecipes([])
     setMachinesForOutput([])
     setInputTargets([])
+    setByproductTargets([])
     setInputRecipeOverrides({})
+    setPendingByproductInput(null)
+  }, [outputTarget])
+
+  useEffect(() => {
+    if (!outputTarget) {
+      setByproductConstraintEnabled(false)
+    }
   }, [outputTarget])
 
   useEffect(() => {
@@ -1395,6 +2923,41 @@ export default function App() {
     }, SEARCH_DEBOUNCE_MS)
     return () => clearTimeout(handle)
   }, [showOutputModal, outputQuery])
+
+  useEffect(() => {
+    if (selectionMode !== "byproduct" || !pendingByproductInput || !showOutputModal) {
+      setByproductRecipes([])
+      setIsLoadingByproductRecipes(false)
+      return
+    }
+    const input = pendingByproductInput
+    const useDownstreamFilter = byproductConstraintEnabled && !!outputTarget
+    setIsLoadingByproductRecipes(true)
+    fetchRecipesByInput({
+      input_type: input.type,
+      item_id: input.type === "item" ? input.id : undefined,
+      meta: input.type === "item" ? input.meta : undefined,
+      fluid_id: input.type === "fluid" ? input.id : undefined,
+      limit: RECIPE_RESULTS_LIMIT,
+      downstream_type: useDownstreamFilter ? outputTarget?.type : undefined,
+      downstream_item_id:
+        useDownstreamFilter && outputTarget?.type === "item" ? outputTarget.id : undefined,
+      downstream_meta:
+        useDownstreamFilter && outputTarget?.type === "item" ? outputTarget.meta : undefined,
+      downstream_fluid_id:
+        useDownstreamFilter && outputTarget?.type === "fluid" ? outputTarget.id : undefined,
+      max_depth: useDownstreamFilter ? BYPRODUCT_CHAIN_DEPTH : undefined
+    })
+      .then(data => setByproductRecipes(data.recipes || []))
+      .catch(() => setByproductRecipes([]))
+      .finally(() => setIsLoadingByproductRecipes(false))
+  }, [
+    selectionMode,
+    pendingByproductInput,
+    byproductConstraintEnabled,
+    outputTarget,
+    showOutputModal
+  ])
 
   useEffect(() => {
     if (!selectedOutput) {
@@ -1463,12 +3026,15 @@ export default function App() {
         : {}
     )
     setInputTargets([])
+    setByproductTargets([])
     setInputRecipeOverrides({})
-    lastTargetRatePerSRef.current = getRatePerS(rateValue, rateUnit)
+    setMachineCountOverrides({})
+    setManualMachineCounts({})
     setGraph(null)
     setError(null)
     setShowOutputModal(false)
     setSelectionMode("output")
+    setPendingByproductInput(null)
     setConfigTab("outputs")
     setGraphTab("graph")
     setRecentRecipes(prev => {
@@ -1502,10 +3068,25 @@ export default function App() {
     setRadialMenu(null)
     setSelectionMode("input")
     setPendingInputRate(ratePerS)
+    setPendingByproductInput(null)
     setSelectedOutput(target)
     setSelectedMachineId(null)
     setOutputRecipes([])
     setMachinesForOutput([])
+    setShowOutputModal(true)
+  }
+
+  const openByproductSelector = (target: Target) => {
+    setRadialMenu(null)
+    setSelectionMode("byproduct")
+    setPendingByproductInput(target)
+    setPendingInputRate(null)
+    setSelectedOutput(null)
+    setSelectedMachineId(null)
+    setOutputRecipes([])
+    setMachinesForOutput([])
+    setOutputQuery("")
+    setOutputResults([])
     setShowOutputModal(true)
   }
 
@@ -1545,6 +3126,7 @@ export default function App() {
     }
     setShowOutputModal(false)
     setSelectionMode("output")
+    setPendingByproductInput(null)
     setSelectedOutput(null)
     setSelectedMachineId(null)
     setOutputRecipes([])
@@ -1552,6 +3134,59 @@ export default function App() {
     setPendingInputRate(null)
     setConfigTab("inputs")
     setGraphTab("graph")
+  }
+
+  const recipeConsumesTarget = (recipe: RecipeOption, target: Target | null) => {
+    if (!target) return false
+    if (target.type === "item") {
+      return (recipe.item_inputs ?? []).some(
+        item => item.item_id === target.id && item.meta === target.meta
+      )
+    }
+    return (recipe.fluid_inputs ?? []).some(fluid => fluid.fluid_id === target.id)
+  }
+
+  const applyByproductSelection = (output: Target, recipe: RecipeOption) => {
+    if (!pendingByproductInput) {
+      setError("Choose a feedback input before selecting a recipe.")
+      return
+    }
+    if (!recipeConsumesTarget(recipe, pendingByproductInput)) {
+      setError(
+        `Selected recipe does not consume ${formatTargetName(pendingByproductInput)}.`
+      )
+      return
+    }
+    const id = getByproductTargetId(pendingByproductInput, output, recipe.rid)
+    const machineTier = getSelectedMachineTier()
+    const selectedTier = machineTier || recipe.min_tier
+    setByproductTargets(prev => {
+      const next = prev.filter(entry => entry.id !== id)
+      next.push({ id, input: pendingByproductInput, output, recipe })
+      return next
+    })
+    if (selectedTier) {
+      setRecipeTierOverrides(prev => ({ ...prev, [recipe.rid]: selectedTier }))
+      setRecipeOverclockTiers(prev => ({
+        ...prev,
+        [recipe.rid]: getOverclockTiers(recipe.min_tier, selectedTier)
+      }))
+    }
+    setShowOutputModal(false)
+    setSelectionMode("output")
+    setPendingByproductInput(null)
+    setSelectedOutput(null)
+    setSelectedMachineId(null)
+    setOutputRecipes([])
+    setMachinesForOutput([])
+    setPendingInputRate(null)
+    setConfigTab("inputs")
+    setGraphTab("graph")
+  }
+
+  const editByproductTarget = (entry: ByproductTarget) => {
+    setByproductTargets(prev => prev.filter(item => item.id !== entry.id))
+    openByproductSelector(entry.input)
   }
 
   const openOutputModal = () => {
@@ -1565,6 +3200,14 @@ export default function App() {
     setOutputQuery("")
     setOutputResults([])
     setPendingInputRate(null)
+    setPendingByproductInput(null)
+  }
+
+  const closeOutputModal = () => {
+    setShowOutputModal(false)
+    setSelectionMode("output")
+    setPendingInputRate(null)
+    setPendingByproductInput(null)
   }
 
   const openOutputRecipeModal = (target: Target) => {
@@ -1578,6 +3221,22 @@ export default function App() {
     setOutputQuery("")
     setOutputResults([])
     setPendingInputRate(null)
+    setPendingByproductInput(null)
+  }
+
+  const handleRadialRecipeChange = () => {
+    if (!radialRecipeMenu) return
+    const targetKeyValue = radialRecipeMenu.outputKey
+    const target = getTargetFromKey(targetKeyValue)
+    if (!target) return
+    if (outputKey && targetKeyValue === outputKey) {
+      openOutputRecipeModal(target)
+      return
+    }
+    const rate =
+      radialRecipeMenu.targetRatePerS ??
+      getInputRateForTarget(target, radialRecipeMenu.rid, targetKeyValue)
+    openInputSelector(target, rate)
   }
 
   async function runGraph() {
@@ -1592,14 +3251,27 @@ export default function App() {
         [outputKey]: selectedRecipe.rid,
         ...inputRecipeOverrides
       }
-      const targetRatePerS = getRatePerS(rateValue, rateUnit)
+      const safeMachineCount = clampWholeNumber(outputMachineCount, 1)
+      const outputRatePerS =
+        rateMode === "output"
+          ? getRatePerS(clampWholeNumber(rateValue, 1))
+          : getOutputRateFromMachines() ?? 0
+      const sanitizedOverrides = Object.entries(machineCountOverrides).reduce<Record<string, number>>(
+        (acc, [key, value]) => {
+          if (!key || key === outputKey) return acc
+          acc[key] = clampWholeNumber(value, 0)
+          return acc
+        },
+        {}
+      )
       const payload = {
         targets: [
           {
             target_type: outputTarget.type,
             target_id: outputTarget.id,
             target_meta: outputTarget.meta,
-            target_rate_per_s: targetRatePerS
+            target_rate_per_s: outputRatePerS,
+            target_machine_count: rateMode === "machines" ? safeMachineCount : undefined
           },
           ...extraTargets.map(entry => ({
             target_type: entry.target.type,
@@ -1612,7 +3284,17 @@ export default function App() {
         overclock_tiers: 0,
         parallel: 1,
         recipe_override: recipeOverride,
-        recipe_overclock_tiers: recipeOverclockTiers
+        recipe_overclock_tiers: recipeOverclockTiers,
+        machine_count_overrides: rateMode === "machines" ? sanitizedOverrides : {},
+        byproduct_targets: byproductTargets.map(entry => ({
+          input_type: entry.input.type,
+          input_id: entry.input.id,
+          input_meta: entry.input.meta,
+          output_type: entry.output.type,
+          output_id: entry.output.id,
+          output_meta: entry.output.meta,
+          recipe_rid: entry.recipe.rid
+        }))
       }
       const data = await fetchGraph(payload)
       setGraph(data)
@@ -1659,10 +3341,20 @@ export default function App() {
           </div>
           <div className="panel-body">
             <div
-              className={`graph-section ${graphTab === "graph" ? "" : "is-hidden"}`}
+              className={`graph-section ${graphTab === "graph" ? "" : "is-hidden"}${
+                radialMenu ? " menu-open" : ""
+              }${isGraphFullscreen ? " is-fullscreen" : ""}`}
               ref={graphSectionRef}
             >
               <div className="graph" ref={containerRef} />
+              <button
+                className="graph-fullscreen-toggle"
+                type="button"
+                aria-pressed={isGraphFullscreen}
+                onClick={toggleGraphFullscreen}
+              >
+                {isGraphFullscreen ? "Exit full screen" : "Full screen"}
+              </button>
               {hoverInfo && (
                 <div
                   className="graph-tooltip"
@@ -1682,6 +3374,8 @@ export default function App() {
                     className="radial-menu"
                     style={{ left: radialMenu.x, top: radialMenu.y }}
                     onClick={event => event.stopPropagation()}
+                    onPointerDown={event => event.stopPropagation()}
+                    onMouseDown={event => event.stopPropagation()}
                   >
                     {radialMenu.kind === "target" && (
                       <>
@@ -1697,6 +3391,14 @@ export default function App() {
                         >
                           Change recipe
                         </button>
+                        {radialMenu.hasByproductSupply && !radialMenu.isOutput && (
+                          <button
+                            className="radial-action radial-action-right"
+                            onClick={() => openByproductSelector(radialMenu.target)}
+                          >
+                            Feedback loop
+                          </button>
+                        )}
                         {radialMenu.isOutput && (
                           <button
                             className="radial-action radial-action-bottom"
@@ -1709,9 +3411,12 @@ export default function App() {
                     )}
                     {radialMenu.kind === "recipe" && (
                       <>
-                        <div className="radial-action radial-action-top radial-label">
-                          Machine tier
-                        </div>
+                        <button
+                          className="radial-action radial-action-top"
+                          onClick={handleRadialRecipeChange}
+                        >
+                          Change recipe
+                        </button>
                         <div className="radial-action radial-action-right radial-select">
                           <select
                             value={getTierForRid(radialMenu.rid, radialMenu.minTier)}
@@ -1734,6 +3439,48 @@ export default function App() {
                             ))}
                           </select>
                         </div>
+                        <div className="radial-action radial-action-bottom radial-input">
+                          <span>Machines</span>
+                          <input
+                            type="number"
+                            min={radialMinValue}
+                            step="1"
+                            value={radialMachineDraft}
+                            disabled={!radialCanEditMachines}
+                            onClick={event => event.stopPropagation()}
+                            onPointerDown={event => event.stopPropagation()}
+                            onMouseDown={event => event.stopPropagation()}
+                            onKeyDown={event => {
+                              if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+                                event.preventDefault()
+                                const delta = event.key === "ArrowUp" ? 1 : -1
+                                const parsed = parseMachineCount(radialMachineDraft, radialMinValue)
+                                const baseValue =
+                                  parsed === null ? radialMachineCountValue : parsed
+                                const nextValue = clampWholeNumber(baseValue + delta, radialMinValue)
+                                setRadialMachineDraft(String(nextValue))
+                                applyRadialMachineCount(nextValue)
+                              }
+                              event.stopPropagation()
+                            }}
+                            onChange={e => {
+                              handleRadialMachineInput(e.currentTarget.value)
+                            }}
+                            onBlur={() => {
+                              const parsed = parseMachineCount(radialMachineDraft, radialMinValue)
+                              if (parsed === null) {
+                                setRadialMachineDraft(String(radialMachineCountValue))
+                              } else {
+                                setRadialMachineDraft(String(parsed))
+                              }
+                            }}
+                            onPaste={event => {
+                              const text = event.clipboardData.getData("text")
+                              event.preventDefault()
+                              handleRadialMachineInput(text)
+                            }}
+                          />
+                        </div>
                       </>
                     )}
                     <button
@@ -1753,7 +3500,7 @@ export default function App() {
                   {outputTarget ? `${formatTargetName(outputTarget)} Line` : "No output selected"}
                 </span>
                 <span>
-                  {formatRateValue(rateUnit === "min" ? rateValue : rateValue * 60)}/min
+                  {formatOutputRate(outputRatePerS)}
                 </span>
                 <span>
                   {totalEnergyPerTick !== null ? `${formatEnergy(totalEnergyPerTick)} EU/t` : "EU/t"}
@@ -1762,43 +3509,90 @@ export default function App() {
             )}
             <div className={`machines-panel ${graphTab === "machines" ? "" : "is-hidden"}`}>
               {recipeStats.length === 0 && <p className="empty">No machine stats yet.</p>}
-              {recipeStats.map(node => (
-                <div key={node.id} className="machine-card">
-                  <strong>{node.label}</strong>
-                  <span>
-                    {node.machines === undefined || Number.isNaN(node.machines)
-                      ? "?"
-                      : Number.isInteger(node.machines)
-                        ? node.machines
-                        : node.machines.toFixed(1)}{" "}
-                    machines
-                  </span>
-                  {node.rid && selectedRecipe?.min_tier && (
-                    <div className="machine-tier">
-                      <label>
-                        Tier
-                        <select
-                          value={recipeTierOverrides[node.rid] || selectedRecipe.min_tier}
+              {recipeStats.map(node => {
+                const nodeOutputKey = node.outputKey
+                const isOutputRecipe = nodeOutputKey && nodeOutputKey === outputKey
+                const defaultCount = Number.isFinite(node.machinesDemand)
+                  ? Math.max(0, Math.ceil(node.machinesDemand || 0))
+                  : clampWholeNumber(node.machines || 0, 0)
+                const machineCountValue = isOutputRecipe
+                  ? outputMachineCount
+                  : nodeOutputKey
+                    ? machineCountOverrides[nodeOutputKey] ?? defaultCount
+                    : defaultCount
+                const canEditMachines = isOutputRecipe || nodeOutputKey
+                return (
+                  <div key={node.id} className="machine-card">
+                    <strong>{node.label}</strong>
+                    {canEditMachines ? (
+                      <label className="machine-count">
+                        Machines
+                        <input
+                          type="number"
+                          min={isOutputRecipe ? "1" : "0"}
+                          step="1"
+                          value={machineCountValue}
                           onChange={e => {
-                            const nextTier = e.target.value
-                            setRecipeTierOverrides(prev => ({ ...prev, [node.rid as string]: nextTier }))
-                            setRecipeOverclockTiers(prev => ({
-                              ...prev,
-                              [node.rid as string]: getOverclockTiers(selectedRecipe.min_tier, nextTier)
-                            }))
+                            const minValue = isOutputRecipe ? 1 : 0
+                            const nextValue = clampWholeNumber(Number(e.target.value), minValue)
+                            if (rateMode !== "machines") {
+                              setRateMode("machines")
+                            }
+                            if (isOutputRecipe) {
+                              setOutputMachineCount(nextValue)
+                            } else if (nodeOutputKey) {
+                              setMachineCountOverrides(prev => ({
+                                ...prev,
+                                [nodeOutputKey]: nextValue
+                              }))
+                              setManualMachineCounts(prev => ({ ...prev, [nodeOutputKey]: true }))
+                            }
                           }}
-                        >
-                          {getTierOptions(selectedRecipe.min_tier, userVoltageTier).map(tier => (
-                            <option key={tier} value={tier}>
-                              {tier}
-                            </option>
-                          ))}
-                        </select>
+                        />
                       </label>
-                    </div>
-                  )}
-                </div>
-              ))}
+                    ) : (
+                      <span>
+                        {node.machines === undefined || Number.isNaN(node.machines)
+                          ? "?"
+                          : Number.isInteger(node.machines)
+                            ? node.machines
+                            : node.machines.toFixed(1)}{" "}
+                        machines
+                      </span>
+                    )}
+                    {node.utilization !== null && node.utilization !== undefined && (
+                      <span>Utilization: {formatUtilization(node.utilization)}</span>
+                    )}
+                    {node.rid && (
+                      <div className="machine-tier">
+                        <label>
+                          Tier
+                          <select
+                            value={getTierForRid(node.rid, node.minTier)}
+                            onChange={e => {
+                              const nextTier = e.target.value
+                              setRecipeTierOverrides(prev => ({
+                                ...prev,
+                                [node.rid as string]: nextTier
+                              }))
+                              setRecipeOverclockTiers(prev => ({
+                                ...prev,
+                                [node.rid as string]: getOverclockTiers(node.minTier, nextTier)
+                              }))
+                            }}
+                          >
+                            {getTierOptions(node.minTier, userVoltageTier).map(tier => (
+                              <option key={tier} value={tier}>
+                                {tier}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
             </div>
           </div>
         </div>
@@ -1843,6 +3637,59 @@ export default function App() {
                     </small>
                   )}
                 </div>
+              )}
+              {outputTarget && (
+                <>
+                  <label className="rate-mode-toggle">
+                    Rate mode
+                    <div className="rate-mode-buttons">
+                      <button
+                        type="button"
+                        className={rateMode === "machines" ? "active" : ""}
+                        onClick={() => setRateMode("machines")}
+                      >
+                        Machine rate
+                      </button>
+                      <button
+                        type="button"
+                        className={rateMode === "output" ? "active" : ""}
+                        onClick={() => setRateMode("output")}
+                      >
+                        Output rate
+                      </button>
+                    </div>
+                  </label>
+                  {rateMode === "machines" && (
+                    <label>
+                      Output machines
+                      <input
+                        type="number"
+                        min="1"
+                        step="1"
+                        value={outputMachineCount}
+                        onChange={e => {
+                          const nextValue = clampWholeNumber(Number(e.target.value), 1)
+                          setOutputMachineCount(nextValue)
+                        }}
+                      />
+                    </label>
+                  )}
+                  {rateMode === "output" && (
+                    <label>
+                      Output rate {rateUnit === "min" ? "(per min)" : "(per sec)"}
+                      <input
+                        type="number"
+                        min="1"
+                        step="1"
+                        value={rateValue}
+                        onChange={e => {
+                          const nextValue = clampWholeNumber(Number(e.target.value), 1)
+                          setRateValue(nextValue)
+                        }}
+                      />
+                    </label>
+                  )}
+                </>
               )}
               <button onClick={openOutputModal}>
                 {outputTarget ? "Change output" : "Select output"}
@@ -1998,6 +3845,61 @@ export default function App() {
                         })}
                     </>
                   )}
+                  {byproductTargets.length > 0 && (
+                    <>
+                      <p className="inputs-title">Feedback loops</p>
+                      <div className="input-targets">
+                        {byproductTargets.map(entry => (
+                          <div key={entry.id} className="input-target">
+                            <div className="input-target-actions">
+                              <button
+                                className="icon-button"
+                                onClick={() => editByproductTarget(entry)}
+                                aria-label="Change feedback loop"
+                                title="Change feedback loop"
+                              >
+                                <svg viewBox="0 0 24 24" aria-hidden="true">
+                                  <path
+                                    d="M4 20h4l10.5-10.5-4-4L4 16v4zm13.8-13.8 1.9-1.9a1 1 0 0 1 1.4 0l1.4 1.4a1 1 0 0 1 0 1.4l-1.9 1.9-4-4z"
+                                    fill="currentColor"
+                                  />
+                                </svg>
+                              </button>
+                              <button
+                                className="icon-button"
+                                onClick={() =>
+                                  setByproductTargets(prev =>
+                                    prev.filter(item => item.id !== entry.id)
+                                  )
+                                }
+                                aria-label="Remove feedback loop"
+                                title="Remove feedback loop"
+                              >
+                                <svg viewBox="0 0 24 24" aria-hidden="true">
+                                  <path
+                                    d="M18 6 6 18M6 6l12 12"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                    strokeLinecap="round"
+                                  />
+                                </svg>
+                              </button>
+                            </div>
+                            <div className="input-target-body">
+                              <strong>
+                                {formatTargetName(entry.input)}{" -> "}
+                                {formatTargetName(entry.output)}
+                              </strong>
+                              <small>
+                                {entry.recipe.machine_name || entry.recipe.machine_id}{" "}
+                                | {(entry.recipe.rid || "").split(":").pop()}
+                              </small>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
                   <p className="inputs-title">Inputs</p>
                   {selectedRecipe.item_inputs?.map(item => {
                     const target: Target = {
@@ -2056,22 +3958,16 @@ export default function App() {
             </div>
             <div className={`options-panel ${configTab === "options" ? "" : "is-hidden"}`}>
               <label>
-                Output rate
-                <input
-                  type="number"
-                  min="0"
-                  step="0.1"
-                  value={rateValue}
-                  onChange={e => setRateValue(Number(e.target.value))}
-                />
-              </label>
-              <label>
-                Rate unit
+                Rate display unit
                 <select
                   value={rateUnit}
                   onChange={e => {
                     const nextUnit = e.target.value as "min" | "sec"
                     if (nextUnit === rateUnit) return
+                    if (rateMode === "output") {
+                      const converted = convertRateValue(rateValue, rateUnit, nextUnit)
+                      setRateValue(clampWholeNumber(Math.round(converted), 1))
+                    }
                     setRateUnit(nextUnit)
                   }}
                 >
@@ -2112,6 +4008,14 @@ export default function App() {
                   type="checkbox"
                   checked={showFlowAnimation}
                   onChange={e => setShowFlowAnimation(e.target.checked)}
+                />
+              </label>
+              <label className="checkbox">
+                <span>Show secondary outputs</span>
+                <input
+                  type="checkbox"
+                  checked={showSecondaryOutputs}
+                  onChange={e => setShowSecondaryOutputs(e.target.checked)}
                 />
               </label>
               <button onClick={runGraph}>Build graph</button>
@@ -2158,17 +4062,78 @@ export default function App() {
         <div className="modal-backdrop">
           <div className="modal">
             <div className="modal-header">
-              <h2>{selectionMode === "output" ? "Select Output" : "Add Input"}</h2>
-              {outputTarget && (
-                <button className="modal-close" onClick={() => setShowOutputModal(false)}>
-                  Close
-                </button>
-              )}
+              <h2>
+                {selectionMode === "output"
+                  ? "Select Output"
+                  : selectionMode === "byproduct"
+                    ? "Add Feedback Loop"
+                    : "Add Input"}
+              </h2>
+              <button className="modal-close" onClick={closeOutputModal}>
+                Close
+              </button>
             </div>
             {!selectedOutput && (
               <div className="modal-section">
+                {selectionMode === "byproduct" && pendingByproductInput && (
+                  <p className="modal-label">
+                    Using feedback input: {formatTargetName(pendingByproductInput)}
+                  </p>
+                )}
+                {selectionMode === "byproduct" && pendingByproductInput && (
+                  <>
+                    <label className="checkbox">
+                      <span>
+                        Only show outputs that lead to{" "}
+                        {outputTarget ? formatTargetName(outputTarget) : "the selected output"}
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={byproductConstraintEnabled}
+                        disabled={!outputTarget}
+                        onChange={e => setByproductConstraintEnabled(e.target.checked)}
+                      />
+                    </label>
+                    {!outputTarget && (
+                      <p className="muted">
+                        Select a planner output to enable downstream filtering.
+                      </p>
+                    )}
+                    <p className="modal-label">Feedback loop outputs</p>
+                    {isLoadingByproductRecipes && (
+                      <p className="empty">Loading feedback loop recipes...</p>
+                    )}
+                    {!isLoadingByproductRecipes && byproductRecipes.length > 0 && (
+                      <p className="muted">
+                        {byproductRecipes.length} recipes consume this feedback input.
+                      </p>
+                    )}
+                    <div className="output-results">
+                      {byproductOutputSuggestions.map(result => (
+                        <button
+                          key={`byproduct:${result.type}:${result.id}:${result.meta}`}
+                          className="output-result"
+                          onClick={() => {
+                            setSelectedOutput(result)
+                            setSelectedMachineId(null)
+                          }}
+                        >
+                          <span>{formatTargetName(result)}</span>
+                          <small>{result.type === "item" ? `meta ${result.meta}` : "fluid"}</small>
+                        </button>
+                      ))}
+                    </div>
+                    {!isLoadingByproductRecipes && byproductOutputSuggestions.length === 0 && (
+                      <p className="empty">No recipes consume this feedback input.</p>
+                    )}
+                  </>
+                )}
                 <p className="modal-label">
-                  {selectionMode === "output" ? "Search outputs" : "Search inputs"}
+                  {selectionMode === "output"
+                    ? "Search outputs"
+                    : selectionMode === "byproduct"
+                      ? "Search outputs"
+                      : "Search inputs"}
                 </p>
                 <input
                   placeholder="Search items or fluids..."
@@ -2256,7 +4221,7 @@ export default function App() {
                 </div>
                 {isLoadingMachines && <p className="empty">Loading machines...</p>}
                 <div className="machine-list">
-                  {machinesForOutput.map(machine => (
+                  {machinesForSelection.map(machine => (
                     <button
                       key={machine.machine_id}
                       onClick={() => setSelectedMachineId(machine.machine_id)}
@@ -2271,7 +4236,7 @@ export default function App() {
                     </button>
                   ))}
                 </div>
-                {!isLoadingMachines && machinesForOutput.length === 0 && (
+                {!isLoadingMachines && machinesForSelection.length === 0 && (
                   <p className="empty">No machines found.</p>
                 )}
               </div>
@@ -2333,6 +4298,15 @@ export default function App() {
                     const visibleRecipes = (group?.recipes || [])
                       .slice()
                       .filter(recipe => isRecipeAllowed(recipe, selectedTier))
+                      .filter(
+                        recipe =>
+                          selectionMode !== "byproduct" || byproductRecipeIds.has(recipe.rid)
+                      )
+                      .filter(
+                        recipe =>
+                          selectionMode !== "byproduct" ||
+                          recipeConsumesTarget(recipe, pendingByproductInput)
+                      )
                       .filter(recipe => matchesRecipeQuery(recipe, recipeQuery))
                       .sort((a, b) => getRecipeEnergy(a) - getRecipeEnergy(b))
                     return (
@@ -2367,7 +4341,9 @@ export default function App() {
                                 onClick={() =>
                                   selectionMode === "output"
                                     ? applyOutputSelection(selectedOutput, recipe)
-                                    : applyInputSelection(selectedOutput, recipe)
+                                    : selectionMode === "byproduct"
+                                      ? applyByproductSelection(selectedOutput, recipe)
+                                      : applyInputSelection(selectedOutput, recipe)
                                 }
                               >
                                 {selectionMode === "output" ? "Select" : "Add"}
@@ -2392,16 +4368,32 @@ export default function App() {
                             </div>
                             <div>
                               <p className="output-io-title">Outputs</p>
-                              {(recipe.item_outputs ?? []).map(item => (
-                                <div key={`${item.item_id}:${item.meta}`} className="output-io-row">
+                              {(recipe.item_outputs ?? []).map((item, index) => (
+                                <div
+                                  key={`${item.item_id}:${item.meta}:${item.count}:${String(item.chance)}:${index}`}
+                                  className="output-io-row"
+                                >
                                   <span>{item.name || item.item_id}</span>
-                                  <small>x{item.count}</small>
+                                  <small>
+                                    x{item.count}
+                                    {formatChanceLabel(item.chance)
+                                      ? ` · ${formatChanceLabel(item.chance)}`
+                                      : ""}
+                                  </small>
                                 </div>
                               ))}
-                              {(recipe.fluid_outputs ?? []).map(fluid => (
-                                <div key={fluid.fluid_id} className="output-io-row">
+                              {(recipe.fluid_outputs ?? []).map((fluid, index) => (
+                                <div
+                                  key={`${fluid.fluid_id}:${fluid.mb}:${String(fluid.chance)}:${index}`}
+                                  className="output-io-row"
+                                >
                                   <span>{formatFluidName(fluid.name, fluid.fluid_id)}</span>
-                                  <small>{fluid.mb} L</small>
+                                  <small>
+                                    {fluid.mb} L
+                                    {formatChanceLabel(fluid.chance)
+                                      ? ` · ${formatChanceLabel(fluid.chance)}`
+                                      : ""}
+                                  </small>
                                 </div>
                               ))}
                             </div>

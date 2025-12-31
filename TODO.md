@@ -1,0 +1,2 @@
+- The platinum dust line says "item:gregtech:gt.metaitem.01 Line" instead of "Platinum Dust Line".
+  - The graph visualization shows "Platinum Dust" as the output but a lot of the other areas of the application do not such as the outputs tab.
