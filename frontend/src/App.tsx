@@ -78,8 +78,6 @@ const EXPORT_STYLE_OVERRIDES: cytoscape.Stylesheet[] = [
     selector: "edge",
     style: {
       "width": 2,
-      "text-background-opacity": 0,
-      "text-background-color": "transparent",
       "text-outline-width": 0,
       "text-background-padding": 0,
       "text-background-shape": "round-rectangle",
@@ -87,12 +85,9 @@ const EXPORT_STYLE_OVERRIDES: cytoscape.Stylesheet[] = [
       "text-background-color": "#161311",
       "overlay-opacity": 0,
       "underlay-opacity": 0,
-      "shadow-opacity": 0,
-      "shadow-blur": 0,
       "curve-style": "unbundled-bezier",
       "edge-distances": "node-position",
       "line-cap": "round",
-      "line-join": "round",
       "arrow-scale": 0,
       "line-opacity": 1,
       "opacity": 1,
@@ -476,7 +471,7 @@ export default function App() {
             "label": "data(label)",
             "color": "#f4efe6",
             "font-family": "Space Grotesk, sans-serif",
-            "font-weight": "600",
+            "font-weight": "bold",
             "font-size": "11px",
             "text-valign": "bottom",
             "text-halign": "center",
@@ -529,7 +524,7 @@ export default function App() {
             "border-width": 1,
             "label": "data(label)",
             "font-family": "Space Grotesk, sans-serif",
-            "font-weight": "700",
+            "font-weight": "bold",
             "font-size": "9px",
             "color": "#2B1F14",
             "text-valign": "center",
@@ -544,9 +539,6 @@ export default function App() {
             "shape": "round-rectangle",
             "opacity": 0.95,
             "border-opacity": 1,
-            "shadow-opacity": 0,
-            "shadow-blur": 0,
-            "shadow-offset-y": 0,
             "z-index": 30,
             "z-index-compare": "manual",
             "events": "no"
@@ -587,7 +579,6 @@ export default function App() {
             "line-opacity": 0.55,
             "arrow-scale": 0.8,
             "line-cap": "round",
-            "line-join": "round",
             "label": "data(label)",
             "font-family": "Space Grotesk, sans-serif",
             "font-size": "10px",
@@ -1990,6 +1981,52 @@ export default function App() {
       if (node.type === "recipe") return
       adjustLeafNode(node.id)
     })
+    const nudgeOverlappingEdges = () => {
+      let moved = false
+      vizEdges.forEach(edge => {
+        const source = cy.getElementById(edge.source)
+        const target = cy.getElementById(edge.target)
+        if (source.empty() || target.empty()) return
+        const sourceBounds = source.boundingBox({ includeLabels: false })
+        const targetBounds = target.boundingBox({ includeLabels: false })
+        if (!boundsIntersect(sourceBounds, targetBounds)) return
+        const sourceData = vizNodeMap.get(edge.source)
+        const targetData = vizNodeMap.get(edge.target)
+        const moveId =
+          sourceData?.type === "recipe" && targetData?.type !== "recipe"
+            ? edge.target
+            : targetData?.type === "recipe" && sourceData?.type !== "recipe"
+              ? edge.source
+              : edge.target
+        const moveNode = cy.getElementById(moveId)
+        const anchorNode = moveId === edge.source ? target : source
+        if (moveNode.empty() || anchorNode.empty()) return
+        const anchorPos = anchorNode.position()
+        const movePos = moveNode.position()
+        let dx = movePos.x - anchorPos.x
+        let dy = movePos.y - anchorPos.y
+        if (Math.abs(dx) < 1e-3 && Math.abs(dy) < 1e-3) {
+          dx = 1
+          dy = 0
+        }
+        const length = Math.hypot(dx, dy) || 1
+        dx /= length
+        dy /= length
+        const bump =
+          Math.max(moveNode.width(), moveNode.height(), 40) +
+          Math.max(anchorNode.width(), anchorNode.height(), 40) / 2 +
+          8
+        moveNode.position({
+          x: anchorPos.x + dx * bump,
+          y: anchorPos.y + dy * bump
+        })
+        moved = true
+      })
+      return moved
+    }
+    for (let i = 0; i < 2; i += 1) {
+      if (!nudgeOverlappingEdges()) break
+    }
     const positionBadgeFor = (targetId: string) => {
       const badge = cy.getElementById(`badge:${targetId}`)
       if (badge.empty()) return
